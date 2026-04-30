@@ -1,0 +1,15 @@
+{
+  "active_plan": "/home/proton/dev/vhost-user-wireguard/.sisyphus/plans/vhost-user-wireguard.md",
+  "started_at": "2026-04-30T02:45:04.343Z",
+  "session_ids": [
+    "ses_223b97334ffeiR4h6pB15Bio7Z",
+    "ses_223b8ccf3ffeuSXfrH6CWenNNo"
+  ],
+  "session_origins": {
+    "ses_223b97334ffeiR4h6pB15Bio7Z": "direct",
+    "ses_223b8ccf3ffeuSXfrH6CWenNNo": "direct"
+  },
+  "plan_name": "vhost-user-wireguard",
+  "agent": "atlas",
+  "task_sessions": {}
+}

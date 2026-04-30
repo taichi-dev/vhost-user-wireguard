@@ -1,0 +1,56 @@
+[package]
+name = "vhost-user-wireguard"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Userspace WireGuard vhost-user-net daemon for KVM/QEMU/Cloud-Hypervisor"
+repository = "https://github.com/owner/vhost-user-wireguard"
+readme = "README.md"
+categories = ["network-programming", "virtualization"]
+keywords = ["wireguard", "vhost-user", "kvm", "dhcp", "virtio"]
+
+[lib]
+name = "vhost_user_wireguard"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vhost-user-wireguard"
+path = "src/main.rs"
+
+[dependencies]
+vhost = { version = "0.16", features = ["vhost-user-backend"] }
+vhost-user-backend = "0.22"
+virtio-queue = "0.17"
+virtio-bindings = "0.2.7"
+vm-memory = "=0.17.1"
+vmm-sys-util = "0.15"
+boringtun = "0.7.0"
+dhcproto = "0.14"
+ip_network_table = "0.2"
+ip_network = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+rustix = { version = "0.38", features = ["fs", "process", "net", "termios"] }
+caps = "0.5"
+sd-notify = "0.4"
+mac_address = "1"
+rand = "0.8"
+base64 = "0.22"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+signal-hook = "0.3"
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
