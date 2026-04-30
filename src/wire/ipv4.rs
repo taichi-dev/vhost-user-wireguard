@@ -12,6 +12,7 @@ impl<'a> Ipv4Packet<'a> {
         if (raw[0] >> 4) != 4 {
             return None;
         }
+        // SAFETY: raw[0] & 0x0f is 0..=15; multiplied by 4 gives 0..=60, fits in usize
         let ihl = ((raw[0] & 0x0f) as usize) * 4;
         if raw.len() < ihl {
             return None;
@@ -20,6 +21,7 @@ impl<'a> Ipv4Packet<'a> {
     }
 
     pub fn header_len(&self) -> usize {
+        // SAFETY: raw[0] & 0x0f is 0..=15; multiplied by 4 gives 0..=60, fits in usize
         ((self.raw[0] & 0x0f) as usize) * 4
     }
 

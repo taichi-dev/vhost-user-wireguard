@@ -87,6 +87,8 @@ impl DhcpOptionsBuilder {
             .map(|r| {
                 let prefix_len = r.prefix.netmask();
                 let net_addr = r.prefix.network_address();
+                // SAFETY: ip_network::Ipv4Network::netmask() returns 0..=32; Ipv4Net::new only
+                // fails if prefix_len > 32, which cannot happen here.
                 let ipnet = Ipv4Net::new(net_addr, prefix_len)
                     .expect("ip_network prefix_len is always valid");
                 (ipnet, r.next_hop)

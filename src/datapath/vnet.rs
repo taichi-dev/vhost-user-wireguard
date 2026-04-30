@@ -68,6 +68,7 @@ pub fn serialize(hdr: &virtio_net_hdr_v1) -> [u8; 12] {
 pub fn rx_header() -> virtio_net_hdr_v1 {
     virtio_net_hdr_v1 {
         flags: 0,
+        // SAFETY: VIRTIO_NET_HDR_GSO_NONE == 0, which fits in u8
         gso_type: VIRTIO_NET_HDR_GSO_NONE as u8,
         hdr_len: 0,
         gso_size: 0,
@@ -78,6 +79,7 @@ pub fn rx_header() -> virtio_net_hdr_v1 {
 
 /// Returns `true` iff `hdr.gso_type == VIRTIO_NET_HDR_GSO_NONE`.
 pub fn tx_header_is_valid(hdr: &virtio_net_hdr_v1) -> bool {
+    // SAFETY: VIRTIO_NET_HDR_GSO_NONE == 0, which fits in u8
     hdr.gso_type == VIRTIO_NET_HDR_GSO_NONE as u8
 }
 

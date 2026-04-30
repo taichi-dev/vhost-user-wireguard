@@ -9,14 +9,17 @@ fn checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut chunks = data.chunks_exact(2);
     for chunk in &mut chunks {
+        // SAFETY: u16 fits in u32; no truncation
         sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
     }
     if let [byte] = chunks.remainder() {
+        // SAFETY: u8 fits in u32; no truncation
         sum += (*byte as u32) << 8;
     }
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
+    // SAFETY: after folding carries, sum fits in u16
     !(sum as u16)
 }
 
@@ -67,10 +70,12 @@ pub fn build_icmp_frag_needed(
 
     // Compute and fill in ICMP checksum.
     let csum = checksum(&icmp);
+    // SAFETY: csum is u16; shifting/masking to u8 is lossless for each byte
     icmp[2] = (csum >> 8) as u8;
     icmp[3] = (csum & 0xff) as u8;
 
     // Build IPv4 header (20 bytes, no options).
+    // SAFETY: icmp_total_len = 8 + orig_hdr_len(<=60) + payload_bytes(<=8) <= 76; 20+76=96 fits u16
     let total_length: u16 = 20 + icmp_total_len as u16;
     let dst_ip = orig.src_ip(); // send back to the original sender
 
@@ -88,6 +93,7 @@ pub fn build_icmp_frag_needed(
 
     // Compute IPv4 header checksum.
     let ip_csum = checksum(&ipv4_hdr);
+    // SAFETY: ip_csum is u16; shifting/masking to u8 is lossless for each byte
     ipv4_hdr[10] = (ip_csum >> 8) as u8;
     ipv4_hdr[11] = (ip_csum & 0xff) as u8;
 

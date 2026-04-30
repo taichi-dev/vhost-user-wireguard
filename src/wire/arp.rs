@@ -17,6 +17,7 @@ impl<'a> ArpPacket<'a> {
     }
 
     pub fn sender_hw_addr(&self) -> [u8; 6] {
+        // SAFETY: slice is exactly 6 bytes; ::new enforces raw.len() >= 28
         self.raw[8..14].try_into().unwrap()
     }
 
@@ -25,6 +26,7 @@ impl<'a> ArpPacket<'a> {
     }
 
     pub fn target_hw_addr(&self) -> [u8; 6] {
+        // SAFETY: slice is exactly 6 bytes; ::new enforces raw.len() >= 28
         self.raw[18..24].try_into().unwrap()
     }
 

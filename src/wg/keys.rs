@@ -38,6 +38,7 @@ pub fn parse_private_key_base64(s: &str) -> Result<x25519_dalek::StaticSecret, W
     if bytes.len() != 32 {
         return Err(WgError::KeyLength { length: bytes.len() });
     }
+    // SAFETY: bytes.len() == 32 is verified by the check above; try_into cannot fail
     let arr: [u8; 32] = bytes.try_into().expect("length checked above");
     Ok(x25519_dalek::StaticSecret::from(arr))
 }
@@ -48,6 +49,7 @@ pub fn parse_preshared_key_base64(s: &str) -> Result<[u8; 32], WgError> {
     if bytes.len() != 32 {
         return Err(WgError::KeyLength { length: bytes.len() });
     }
+    // SAFETY: bytes.len() == 32 is verified by the check above; try_into cannot fail
     let arr: [u8; 32] = bytes.try_into().expect("length checked above");
     Ok(arr)
 }
@@ -64,6 +66,7 @@ fn check_key_file_mode(path: &Path) -> Result<(), WgError> {
         path: path.to_owned(),
         source: std::io::Error::from_raw_os_error(e.raw_os_error()),
     })?;
+    // SAFETY: st_mode is a POSIX mode_t (u32 on Linux); cast is lossless
     let mode = stat.st_mode as u32;
     if mode & 0o077 != 0 {
         return Err(WgError::KeyFileMode {

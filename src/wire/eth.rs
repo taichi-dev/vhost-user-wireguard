@@ -13,10 +13,12 @@ impl<'a> EthFrame<'a> {
     }
 
     pub fn dst_mac(&self) -> [u8; 6] {
+        // SAFETY: slice is exactly 6 bytes; ::new enforces raw.len() >= 14
         self.raw[0..6].try_into().unwrap()
     }
 
     pub fn src_mac(&self) -> [u8; 6] {
+        // SAFETY: slice is exactly 6 bytes; ::new enforces raw.len() >= 14
         self.raw[6..12].try_into().unwrap()
     }
 

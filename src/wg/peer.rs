@@ -101,6 +101,7 @@ impl Peer {
             peer_public_key,
             preshared_key,
             persistent_keepalive,
+            // SAFETY: idx is a peer index bounded by the configured peer count (max 255); fits in u32
             idx as u32,
             Some(rate_limiter),
         );
