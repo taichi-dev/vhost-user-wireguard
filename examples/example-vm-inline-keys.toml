@@ -1,0 +1,125 @@
+# =============================================================================
+# Description: vhost-user WireGuard reference configuration (inline-key form)
+#
+# Identical to example-vm.toml but uses inline base64 keys instead of key
+# files. Suitable for testing and environments where file-based secrets are
+# not yet set up.
+#
+# SECURITY NOTE: Inline keys appear in process listings and config backups.
+# Prefer private_key_file / preshared_key_file in production.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# [vm] — Virtual machine network identity
+# -----------------------------------------------------------------------------
+[vm]
+
+# MAC address assigned to the virtio-net interface inside the VM.
+# Format: colon-separated hex octets (e.g. "52:54:00:xx:xx:xx" for QEMU range)
+mac = "52:54:00:12:34:01"
+
+# Maximum Transmission Unit for the VM's virtual NIC.
+# Range: 576–9000. Recommended: 1420 (accounts for WireGuard overhead).
+mtu = 1420
+
+# IP address of the VM inside the /30 subnet.
+# Must be a host address (not network or broadcast) and must not equal gateway.
+ip = "10.42.0.2"
+
+
+# -----------------------------------------------------------------------------
+# [vhost_user] — vhost-user socket configuration
+# -----------------------------------------------------------------------------
+[vhost_user]
+
+# Path to the UNIX domain socket that QEMU/Cloud Hypervisor connects to.
+# The parent directory must exist before the daemon starts.
+socket = "/tmp/vhost-user-wg/vm1.sock"
+
+# Virtqueue depth. Must be a power of 2 in [64, 4096]. Default: 256.
+queue_size = 256
+
+# Number of virtqueue pairs (RX + TX). Must be exactly 2.
+num_queues = 2
+
+
+# -----------------------------------------------------------------------------
+# [network] — Layer-3 topology visible to the VM
+# -----------------------------------------------------------------------------
+[network]
+
+# The /30 subnet shared between the host gateway and the VM.
+# Only /30 is accepted (exactly 2 usable host addresses).
+subnet = "10.42.0.0/30"
+
+# IP address of the gateway (host side of the point-to-point link).
+# Must be inside the subnet and must not be the network or broadcast address.
+gateway = "10.42.0.1"
+
+# DNS resolvers advertised to the VM via DHCP option 6.
+dns = ["8.8.8.8"]
+
+
+# -----------------------------------------------------------------------------
+# [wireguard] — WireGuard tunnel configuration
+# -----------------------------------------------------------------------------
+[wireguard]
+
+# Inline base64-encoded 32-byte private key.
+# Exactly one of private_key or private_key_file must be set.
+# Generate: wg genkey
+private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+# UDP port this WireGuard interface listens on. Range: 1–65535.
+listen_port = 51820
+
+
+# -----------------------------------------------------------------------------
+# [[wireguard.peers]] — Remote WireGuard peer (repeat section for each peer)
+# -----------------------------------------------------------------------------
+[[wireguard.peers]]
+
+# Human-readable label for logs and diagnostics.
+name = "hypervisor-host"
+
+# Base64-encoded 32-byte Curve25519 public key of the remote peer.
+public_key = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+
+# Inline preshared key (optional, adds post-quantum resistance).
+# Omit both preshared_key and preshared_key_file to disable.
+preshared_key = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC="
+
+# Remote endpoint. Must be an IP:port literal — DNS names are not supported.
+endpoint = "127.0.0.1:51821"
+
+# CIDR ranges whose traffic is routed through this peer.
+allowed_ips = ["10.0.0.0/24"]
+
+# Send a keepalive packet every N seconds (optional). Range: 1–65535.
+# persistent_keepalive = 25
+
+
+# -----------------------------------------------------------------------------
+# [dhcp] — DHCP server settings
+# -----------------------------------------------------------------------------
+[dhcp]
+
+# Seconds an IP is withheld after DHCP DECLINE before reuse. Range: 1–3600.
+decline_probation_secs = 3600
+
+# Lease database flush interval in seconds. Range: 1–86400.
+checkpoint_secs = 60
+
+# Static MAC→IP reservations (optional).
+reservations = []
+
+
+# [dhcp.pool] — Dynamic address pool
+[dhcp.pool]
+
+# First address handed out dynamically. Must be inside subnet, not network addr.
+start = "10.42.0.2"
+
+# Last address handed out dynamically (inclusive). Must be >= start, not bcast.
+end = "10.42.0.2"

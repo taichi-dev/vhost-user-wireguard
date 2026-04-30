@@ -1,0 +1,161 @@
+# =============================================================================
+# Description: vhost-user WireGuard reference configuration
+#
+# This file documents every supported field with its allowed range/default.
+# Copy it, adjust the values, and point the daemon at it with:
+#
+#   vhost-user-wireguard --config /etc/vhost-user-wg/vm1.toml
+#
+# Validate without starting the daemon:
+#
+#   vhost-user-wireguard --check-config --config /etc/vhost-user-wg/vm1.toml
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# [vm] — Virtual machine network identity
+# -----------------------------------------------------------------------------
+[vm]
+
+# MAC address assigned to the virtio-net interface inside the VM.
+# Format: colon-separated hex octets (e.g. "52:54:00:xx:xx:xx" for QEMU range)
+mac = "52:54:00:12:34:01"
+
+# Maximum Transmission Unit for the VM's virtual NIC.
+# Range: 576–9000. Recommended: 1420 (accounts for WireGuard overhead).
+mtu = 1420
+
+# IP address of the VM inside the /30 subnet.
+# Must be a host address (not network or broadcast) and must not equal gateway.
+# In a /30 (4 addresses), only .1 and .2 are usable; gateway takes one.
+ip = "10.42.0.2"
+
+
+# -----------------------------------------------------------------------------
+# [vhost_user] — vhost-user socket configuration
+# -----------------------------------------------------------------------------
+[vhost_user]
+
+# Path to the UNIX domain socket that QEMU/Cloud Hypervisor connects to.
+# The parent directory must exist before the daemon starts.
+# Default runtime location: /run/vhost-user-wg/<vm-name>.sock
+socket = "/tmp/vhost-user-wg/vm1.sock"
+
+# Virtqueue depth. Must be a power of 2 in [64, 4096].
+# Higher values reduce latency spikes under burst traffic.
+# Default: 256
+queue_size = 256
+
+# Number of virtqueue pairs (RX + TX). Must be exactly 2.
+num_queues = 2
+
+
+# -----------------------------------------------------------------------------
+# [network] — Layer-3 topology visible to the VM
+# -----------------------------------------------------------------------------
+[network]
+
+# The /30 subnet shared between the host gateway and the VM.
+# Only /30 is accepted (exactly 2 usable host addresses).
+subnet = "10.42.0.0/30"
+
+# IP address of the gateway (host side of the point-to-point link).
+# Must be inside the subnet and must not be the network or broadcast address.
+gateway = "10.42.0.1"
+
+# DNS resolvers advertised to the VM via DHCP option 6.
+# Provide one or more IPv4 addresses.
+dns = ["8.8.8.8"]
+
+
+# -----------------------------------------------------------------------------
+# [wireguard] — WireGuard tunnel configuration
+# -----------------------------------------------------------------------------
+[wireguard]
+
+# Private key for this WireGuard interface.
+#
+# Option A (recommended for production): store the key in a file readable only
+# by the daemon user, and reference it here:
+#
+#   private_key_file = "/etc/vhost-user-wg/keys/vm1.key"
+#
+# Option B (inline, shown below): embed the base64-encoded 32-byte key directly.
+# Exactly one of private_key_file or private_key must be set.
+#
+# Generate a key pair with: wg genkey | tee vm1.key | wg pubkey
+private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+# UDP port this WireGuard interface listens on.
+# Range: 1–65535. Typical: 51820.
+listen_port = 51820
+
+
+# -----------------------------------------------------------------------------
+# [[wireguard.peers]] — Remote WireGuard peer (repeat section for each peer)
+# -----------------------------------------------------------------------------
+[[wireguard.peers]]
+
+# Human-readable label for logs and diagnostics.
+name = "hypervisor-host"
+
+# Base64-encoded 32-byte Curve25519 public key of the remote peer.
+# Generate with: wg pubkey < peer.key
+public_key = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+
+# Preshared key for this peer (optional, adds post-quantum resistance).
+#
+# Option A (recommended): store in a file:
+#   preshared_key_file = "/etc/vhost-user-wg/keys/vm1-peer1.psk"
+#
+# Option B (inline):
+#   preshared_key = "BASE64_32_BYTE_PSK_HERE="
+#
+# Omit both to disable preshared key for this peer.
+
+# Remote endpoint. Must be an IP:port literal — DNS names are not supported.
+endpoint = "127.0.0.1:51821"
+
+# CIDR ranges whose traffic is routed through this peer.
+# Use "0.0.0.0/0" to route all traffic (default route).
+allowed_ips = ["10.0.0.0/24"]
+
+# Send a keepalive packet every N seconds (optional).
+# Useful when the peer is behind NAT. Range: 1–65535.
+# persistent_keepalive = 25
+
+
+# -----------------------------------------------------------------------------
+# [dhcp] — DHCP server settings
+# -----------------------------------------------------------------------------
+[dhcp]
+
+# Seconds an IP address is withheld after a DHCP DECLINE before being reused.
+# Range: 1–3600. Default: 86400 (1 hour).
+decline_probation_secs = 3600
+
+# How often (in seconds) the lease database is flushed to disk.
+# Range: 1–86400. Default: 60.
+checkpoint_secs = 60
+
+# Static MAC→IP reservations (optional). Each entry is a TOML inline table.
+# IPs must be inside the subnet, must not equal the gateway, and must not
+# overlap the dynamic pool below.
+#
+# Example:
+#   reservations = [
+#     { mac = "52:54:00:ab:cd:ef", ip = "10.42.0.2", hostname = "my-vm" },
+#   ]
+reservations = []
+
+
+# [dhcp.pool] — Dynamic address pool
+[dhcp.pool]
+
+# First address handed out dynamically.
+# Must be inside the subnet, must not be the network address.
+start = "10.42.0.2"
+
+# Last address handed out dynamically (inclusive).
+# Must be >= start, must not be the broadcast address.
+end = "10.42.0.2"
