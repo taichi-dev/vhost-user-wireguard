@@ -401,3 +401,84 @@
 - `InterceptDecision::Tunnel { peer_idx, ip_packet }` — peer_idx is the route lookup result and currently not used by the dispatch; the spec requires extracting dst_ip from `ip_packet[16..20]` and re-routing through `WgEngine::handle_tx_ip_packet(dst_ip, &ip_packet)`.
 - Length sanity check before slicing: `ip_packet.len() >= 20` (offset 16 + addr len 4) → otherwise `BadIpv4Header` drop. classify already filters short packets but defensive check is cheap.
 - WG dispatch failure (e.g., no route after engine state change) is logged at trace level + counted as `NoRoute` drop — does NOT propagate as VhostError.
+
+## T28 (datapath/mod.rs): VhostUserBackendMut + reconnect-aware fd registration
+
+### vhost-user-backend 0.22 API surface
+- `VhostUserBackendMut::exit_event` returns `Option<(EventConsumer, EventNotifier)>`, NOT `Option<EventFd>` as some older docs (and the original task spec) say. The framework consumes the consumer into its epoll and keeps the notifier for `send_exit_event()`. Use `vmm_sys_util::event::{EventConsumer, EventNotifier}`.
+- `VringEpollHandler::register_listener(fd, ev_type, data)` rejects any `data <= num_queues()` — the framework reserves token slot `num_queues()` for its own exit notifier, so backend-registered fds MUST start at `num_queues() + 1`.
+- `VhostUserDaemon::serve(socket_path)` is the convenience one-shot: it bind-listen-accept-handle-exit. It already coerces `Disconnected`/`PartialMessage` errors into `Ok(())`, so the wrapper just needs to translate the remaining error variants.
+- `VhostUserDaemon<T>` requires `T: VhostUserBackend + Clone + 'static`. The blanket `impl<T: VhostUserBackend> VhostUserBackend for Arc<T>` plus `impl<T: VhostUserBackendMut> VhostUserBackend for Mutex<T>` makes `Arc<Mutex<WgNetBackend>>` work.
+
+### Two-lifetime trick for Tx/Rx processor borrow split
+Original `TxProcessor<'a, M> { rx: &'a mut RxProcessor<'a, M>, ... }` unifies the reborrow lifetime with the inner data lifetime, making the `&mut rx` borrow invariant for the *whole scope of `rx`*. After `tx.process()` returns, the compiler still considers `rx` mutably borrowed and refuses `self.rx_queue = rx.queue;`.
+
+Fix: split into two lifetimes — `TxProcessor<'r, 'a, M> { rx: &'r mut RxProcessor<'a, M>, ... }`. The reborrow lifetime `'r` ends when `tx` is dropped; `'a` (the data lifetime) can outlive it. Construction sites are unchanged because both lifetimes are inferred. This is a textbook "decouple invariant nested lifetimes" pattern.
+
+### virtio_net_config layout (12 bytes consumed)
+mac[6] + status[2] + max_virtqueue_pairs[2] + mtu[2]. Even when NOT advertising VIRTIO_NET_F_MQ, `max_virtqueue_pairs` sits at its struct offset; setting it to 1 is harmless. Without this padding the guest would read garbage at offset 10..12 expecting MTU.
+
+### Feature bit hygiene (security-relevant)
+NO offload advertisement: NO `VIRTIO_NET_F_CSUM`, `GUEST_CSUM`, `GUEST_TSO4/6`, `GUEST_ECN`, `GUEST_UFO`, `HOST_TSO4/6`, `HOST_ECN`, `HOST_UFO`, `CTRL_VQ`, `MQ`. The trust-boundary classifier in `intercept.rs` rejects multi-fragment / GSO frames; advertising any offload would let a malicious guest bypass it. Test `test_features_no_offload_advertised` enforces this.
+
+### `&mut self.wg` while holding `&self.wg.route` workaround
+Borrow-splitting a struct field through a method call is not possible (no field-level borrows on private fields from an external impl). Used a `*const _` raw-pointer reborrow with a documented `// SAFETY:` invariant: `WgEngine::route` is logically `const` after construction (peers + allowed_ips are validated once and never reshuffled). The unsafe block is the smallest possible.
+
+### DhcpServer lease lookup gap
+`DhcpServer` exposes `handle_packet` and `checkpoint` but no public method to resolve "current lease IP for a given MAC". Per the constraint NOT to modify files outside `src/datapath/`, the backend instead carries the static `vm_ip: Ipv4Addr` (from `Vm.ip` config) — which IS the IP the DHCP server is configured to lease. This works because the DHCP pool/reservations are pinned to the VM's static config IP at validation time.
+
+### Reconnect-aware fd registration
+The framework rebuilds its epoll handler on every reconnect (frontend disconnect → daemon.serve returns → new daemon.serve binds a fresh handler). External fds registered via `register_listener` are dropped with the old handler. `register_external_fds` is therefore designed to be called *every time* a new serve cycle starts, not once at daemon construction.
+
+## [2026-04-30] T-final: lib.rs::run() + main.rs daemon wiring
+
+### Missing `pub mod toml` in config/mod.rs (necessary plumbing fix)
+`src/config/toml.rs` existed (with full `load(path) -> Result<Config, ConfigError>` impl + 4 tests) but was NOT exposed via `mod toml;` in `src/config/mod.rs`. Rust silently treats unreferenced files as dead — the loader was unreachable. Added `pub mod toml;` to expose it. Test count went 157 → 161 (4 new toml tests now compiled).
+
+### Actual `WgNetBackend::new` signature differs from inherited wisdom
+The wisdom claimed `(config: &Config, intercept_cfg, dhcp, wg)` but the real signature is:
+```rust
+pub fn new(
+    intercept_cfg: InterceptCfg,
+    dhcp: DhcpServer,
+    wg: WgEngine,
+    vm_ip: Ipv4Addr,
+    queue_size: u16,
+    checkpoint_interval: Duration,
+) -> Result<Self, VhostError>
+```
+No `&Config` parameter — fields are decomposed into the four primitive args. ALWAYS check actual signatures, not inherited wisdom blindly.
+
+### Gateway MAC is a hardcoded constant, not a config field
+`config::Network` has no `gateway_mac` field. The convention used throughout tests is `[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]` — the `0x02` first-byte makes it a locally-administered, unicast MAC. Hardcoded as `GATEWAY_MAC` in `lib.rs` so lease persistence + classify() stays deterministic across restarts.
+
+### Lease persist path is also hardcoded
+No `dhcp.lease_path` config field exists. Hardcoded `/var/lib/vhost-user-wireguard/leases.json` per FHS conventions (state surviving reboot lives in `/var/lib`).
+
+### `GuestMemoryAtomic::new(GuestMemoryMmap::<()>::new())` is the empty-memory idiom
+`GuestRegionCollection<R>: Default` provides `GuestMemoryMmap::<()>::new()` returning an empty container. Frontend populates it later via SET_MEM_TABLE. Pattern observed in `vhost-user-backend-0.22.0/tests/vhost-user-server.rs:250`.
+
+### CliArgs lacks user/group fields
+The inherited wisdom said CliArgs *should* have `user: Option<String>` and `group: Option<String>` for privilege drop, but the actual `src/config/cli.rs` does not expose them. Since the task constraints forbid modifying cli.rs (the `--check-config` flag is already present, so the conditional permission doesn't apply), `drop_privileges(None, None)` is called — a structured no-op when no user/group is configured. This is acceptable: privilege drop becomes a future enhancement requiring a separate cli.rs change.
+
+### `CliArgs.config` is `Option<PathBuf>` (no default)
+If `--config` is absent, `run()` returns `Error::Config(ConfigError::FileRead { ... })` with `InvalidInput` source. No silent fallback to a default path.
+
+### `signal_hook::iterator::Signals::new([SIGTERM, SIGINT])` API
+Accepts an array slice (or anything `IntoIterator<Item=&i32>`). Returns `io::Result<Signals>`, which auto-converts via `Error::Io` (`#[from] io::Error`) — so `?` operator works directly on `Signals::new(...)?` inside `run()`.
+
+### `Signals::forever()` is single-shot in our usage
+`signals.forever()` returns an iterator that blocks until next signal. We `break` after the first signal because the serve loop will tear down on the first observed exit-fd write — looping makes no sense.
+
+### `run_serve_loop` does NOT call `register_external_fds`
+The current `run_serve_loop` in `src/datapath/mod.rs` is a thin wrapper around `daemon.serve(socket_path)`. It does NOT register the WG UDP socket fd, timerfd, or exit fd with the framework's `VringEpollHandler`. This means external events (incoming WG packets, timer ticks, exit signals) are NOT delivered to `WgNetBackend::handle_event`. This is a known gap in the existing implementation that this task did not address — the `_backend` parameter is a placeholder for the eventual upgrade to a `start()`/`get_epoll_handlers()`/`register_external_fds()`/`wait()` pattern.
+
+### Privilege drop ordering: BEFORE notify_ready
+The systemd contract is that `READY=1` indicates the daemon has reached its fully-initialised, hardened state. Calling `drop_privileges()` AFTER `notify_ready()` would create a window where a privileged daemon claims to be ready. Order in `run()`: drop_privileges → drop_capabilities → notify_ready → daemon construction → serve loop.
+
+### `zeroize::Zeroize` is implemented for `String`
+`String: Zeroize` overwrites the in-place buffer (the heap allocation) with zeroes. The String header (len/cap) survives, but the secret bytes are gone. Best-effort: any prior clones would still hold the secret. Used here because `Config` is reference-counted to be passed around but inline keys are leaked into `Wireguard::private_key: Option<String>` after parsing.
+
+### Build verification
+- `cargo build --release --locked` → exits 0, binary at `target/release/vhost-user-wireguard` (~2.8 MB).
+- `cargo test --lib` → 161 tests pass (was 157 before exposing `config::toml`).

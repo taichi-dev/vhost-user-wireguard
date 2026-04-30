@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod cli;
+pub mod toml;
 pub mod validate;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
