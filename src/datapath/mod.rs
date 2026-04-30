@@ -36,7 +36,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vhost::vhost_user::message::VhostUserProtocolFeatures;
+use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost_user_backend::{VhostUserBackend, VhostUserBackendMut, VhostUserDaemon, VringEpollHandler, VringRwLock};
 use virtio_bindings::bindings::virtio_net::{
     VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_MTU, VIRTIO_NET_F_STATUS,
@@ -336,12 +336,19 @@ impl VhostUserBackendMut for WgNetBackend {
         // We deliberately do NOT advertise any offload features
         // (CSUM, GUEST/HOST_TSO4/6, UFO, etc.), nor CTRL_VQ or MQ.
         // The trust-boundary pipeline assumes raw, single-fragment frames.
+        //
+        // VHOST_USER_F_PROTOCOL_FEATURES (bit 30) MUST be advertised so the
+        // vhost-user frontend (QEMU/Cloud-Hypervisor) negotiates protocol
+        // features (CONFIG, REPLY_ACK). Without it, QEMU fails vhost-net
+        // startup with EINVAL ("unable to start vhost net: 22") and falls
+        // back to userspace virtio with no working datapath.
         (1u64 << VIRTIO_F_VERSION_1_BIT)
             | (1u64 << VIRTIO_NET_F_MAC)
             | (1u64 << VIRTIO_NET_F_MTU)
             | (1u64 << VIRTIO_NET_F_MRG_RXBUF)
             | (1u64 << VIRTIO_NET_F_STATUS)
             | (1u64 << VIRTIO_RING_F_EVENT_IDX)
+            | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
     }
 
     fn protocol_features(&self) -> VhostUserProtocolFeatures {
@@ -552,22 +559,38 @@ pub fn run_serve_loop(
 
     let mut listener = Listener::new(socket_path, true)
         .map_err(|e| Error::Vhost(VhostError::Backend(e.to_string())))?;
-    daemon
-        .start(&mut listener)
-        .map_err(|e| Error::Vhost(VhostError::Backend(e.to_string())))?;
 
-    for handler in daemon.get_epoll_handlers() {
-        register_external_fds(&handler, wg_socket_fd, timer_fd, exit_fd)?;
-    }
+    // QEMU 8.2.x's vhost-user-net does a multi-phase init: the first
+    // connection is a probe (GET_FEATURES, GET_PROTOCOL_FEATURES,
+    // SET_PROTOCOL_FEATURES, SET_OWNER, SET_VRING_KICK/CALL,
+    // SET_VRING_ENABLE) and the framework's strict feature check fails on
+    // the final SET_VRING_ENABLE because SET_FEATURES was never sent. QEMU
+    // then disconnects and reconnects with the actual VM-start sequence
+    // (which DOES include SET_FEATURES + SET_MEM_TABLE + SET_VRING_NUM/
+    // ADDR/BASE before SET_VRING_ENABLE). We therefore loop accepting
+    // connections; external fds are re-registered on every reconnect (the
+    // framework rebuilds its epoll handler when start() is called).
+    loop {
+        daemon
+            .start(&mut listener)
+            .map_err(|e| Error::Vhost(VhostError::Backend(e.to_string())))?;
 
-    match daemon.wait() {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let s = e.to_string();
-            if s.contains("Disconnected") || s.contains("PartialMessage") {
-                Ok(())
-            } else {
-                Err(Error::Vhost(VhostError::Backend(s)))
+        for handler in daemon.get_epoll_handlers() {
+            register_external_fds(&handler, wg_socket_fd, timer_fd, exit_fd)?;
+        }
+
+        match daemon.wait() {
+            Ok(()) => continue,
+            Err(e) => {
+                let s = e.to_string();
+                if s.contains("Disconnected")
+                    || s.contains("PartialMessage")
+                    || s.contains("InactiveFeature")
+                    || s.contains("InvalidParam")
+                {
+                    continue;
+                }
+                return Err(Error::Vhost(VhostError::Backend(s)));
             }
         }
     }

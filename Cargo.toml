@@ -62,3 +62,7 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+[patch.crates-io]
+vhost = { path = "vendor/vhost" }
+vhost-user-backend = { path = "vendor/vhost-user-backend" }
