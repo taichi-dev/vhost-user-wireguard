@@ -50,6 +50,11 @@ zeroize = "1"
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
+# Tests need the master/frontend side of the vhost-user wire protocol
+# in addition to the backend side already enabled in [dependencies].
+# Cargo unifies feature flags between [dependencies] and [dev-dependencies].
+vhost = { version = "0.16", features = ["vhost-user-frontend"] }
+vmm-sys-util = "0.15"
 
 [profile.release]
 lto = "thin"

@@ -482,3 +482,48 @@ The systemd contract is that `READY=1` indicates the daemon has reached its full
 ### Build verification
 - `cargo build --release --locked` → exits 0, binary at `target/release/vhost-user-wireguard` (~2.8 MB).
 - `cargo test --lib` → 161 tests pass (was 157 before exposing `config::toml`).
+
+## T30 (first unit): mock vhost-user master harness + feature-negotiation smoke (2026-04-30)
+
+### Same crate in [dependencies] + [dev-dependencies] = feature union for tests
+The production daemon needs `vhost = { features = ["vhost-user-backend"] }` and the test harness needs the master/frontend side, gated behind `vhost-user-frontend`. Cargo unifies feature flags between `[dependencies]` and `[dev-dependencies]` for the same crate — adding `vhost = { features = ["vhost-user-frontend"] }` to dev-deps makes BOTH features active during `cargo test`/`cargo build --tests`, while production `cargo build --release` stays minimal. The dev-deps line looks like a duplicate; a comment is mandatory or a future maintainer will delete it.
+
+### vhost::Frontend trait imports are non-obvious
+`vhost::vhost_user::Frontend` (the master struct) implements both `vhost::VhostBackend` and `vhost::vhost_user::VhostUserFrontend`. `set_owner`, `get_features`, `set_features`, `set_mem_table`, etc. live on `VhostBackend`; `get_protocol_features`/`set_protocol_features`/`get_config`/`set_vring_enable` live on `VhostUserFrontend`. Both traits MUST be `use`'d to call methods. The `vhost::backend` module itself is private (`mod backend;` not `pub mod`), so `use vhost::backend::VhostBackend` fails — `vhost` re-exports `VhostBackend` at the crate root: `use vhost::VhostBackend;`.
+
+### Daemon does NOT advertise VhostUserVirtioFeatures::PROTOCOL_FEATURES (bit 30)
+`src/datapath/mod.rs::WgNetBackend::features()` returns only the 6 device feature bits and omits the `VHOST_USER_F_PROTOCOL_FEATURES` master/backend negotiation bit. As a consequence, calling `Frontend::get_protocol_features()` returns `Err(InactiveFeature(PROTOCOL_FEATURES))` — the master sees `set_features` rejected for any bit outside what the backend advertised, so it cannot enable the gate and the daemon never reaches the `protocol_features()` exchange. The harness MUST guard the protocol-features step with `if advertised_virtio & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() != 0 { ... }`. Real frontends (qemu, cloud-hypervisor) follow the same conditional pattern. Whether to add the bit to `WgNetBackend::features()` is a separate fix — out of T30 scope, but T31+ should consider it because `CONFIG`/`REPLY_ACK` advertised in `protocol_features()` go unused without it.
+
+### vhost-user-backend's `get_features` returns ONLY the backend's `features()`
+Confirmed in `vhost-user-backend-0.22.0/src/handler.rs:291-293` — no auto-OR of `PROTOCOL_FEATURES`. Some other backends (the crate's own MockVhostBackend) return `0xffff_ffff_ffff_ffff` to side-step this; production backends must include the bit explicitly.
+
+### `tempfile::TempPath` requires explicit type binding for `Command::arg`
+`Command::arg<S: AsRef<OsStr>>(arg: S)` cannot infer `S` when fed `tempfile::TempPath`'s `as_ref()` because TempPath has multiple `AsRef` impls (`AsRef<OsStr>`, `AsRef<Path>`). Workaround: bind through an intermediate `let cfg_arg: &Path = config_path.as_ref();` then `cmd.arg(cfg_arg);` — this disambiguates because `Path: AsRef<OsStr>`.
+
+### `UnixDatagram` reader thread + `tempfile::TempDir` for fake NOTIFY_SOCKET
+`fake_notify_socket()` binds an `AF_UNIX SOCK_DGRAM` listener inside a `tempfile::TempDir`, and the reader thread `move`s the `TempDir` into its closure as `_dir_guard` so the directory survives until the thread exits. The thread polls with a 250ms read timeout and exits when either `recv` reports zero bytes OR the socket file vanishes (parent dir removed) — without the timeout the join would block forever in the common case where the daemon never writes. Captured lines are returned as `Vec<String>` via the join handle.
+
+### dhcproto v4 message construction for test fixtures
+`dhcproto::v4::Message::default()` initial state has `Opcode::BootRequest`, random xid, empty opts. Need: `set_opcode(BootRequest)` (defensive), `set_htype(HType::Eth)`, `set_xid(u32)`, `set_flags(Flags::default().set_broadcast())`, `set_chaddr(&mac)`, `set_opts(opts)` where `opts.insert(DhcpOption::MessageType(MessageType::Discover))` plus parameter request list. Encoder: `let mut buf = Vec::new(); { let mut enc = Encoder::new(&mut buf); msg.encode(&mut enc).unwrap(); }` — scope the encoder so the `&mut buf` borrow drops before the buffer is reused.
+
+### Test port allocator pattern for parallel test runs
+`AtomicU16` initialized at 51820, fetched with `Ordering::Relaxed`. Each test gets a unique listen port, avoiding cross-test EADDRINUSE collisions when `cargo test` runs in parallel. Wrap-to-51820 on overflow. Validation rejects port=0 so the wrap MUST avoid zero.
+
+### Cargo `--check-config` validation is permissive on dummy WG keys
+A `[u8; 32]` filled with `0x11` (or any constant) base64-encodes into a 44-char string the daemon's parser accepts as a valid WireGuard private key — there's no parity check. This is the cleanest way to satisfy `validate::validate` for tests without spawning real key material.
+
+### Daemon binary location heuristic for tests
+`tests/common/mod.rs::resolve_daemon_binary()` checks (in order): `VHOST_USER_WIREGUARD_BIN` env override, `target/release/vhost-user-wireguard` (works for `cargo test` from project root), `${CARGO_TARGET_DIR}/release/vhost-user-wireguard` (workspace builds). Falls back to the first candidate even if missing so the panic message points at the conventional path.
+
+### Verification (T30 first unit)
+- `cargo build --tests --test integration_smoke` clean.
+- `cargo test --test integration_smoke -- harness_self_test --exact --nocapture` — 1 passed, 0 failed.
+- `cargo test --lib` — 161 tests still pass (unchanged).
+- `cargo clippy --tests` — zero warnings on new test files (pre-existing `never_loop` error in `src/lib.rs::spawn_signal_thread` is unrelated and predates T30).
+
+### Deferred to next unit (T31+)
+Public API surface is stable; impl is `unimplemented!()` for:
+- `MockVhostUserMaster::write_tx_frame` — needs SET_MEM_TABLE + descriptor table + avail ring write + kick eventfd.
+- `MockVhostUserMaster::read_rx_frame` — needs used ring poll + descriptor read.
+- `MockVhostUserMaster::disconnect_and_reconnect` data plane — currently re-negotiates features only; vring re-arm pending.
+- `tests/integration_smoke.rs::reconnect_re_registers` — depends on the data plane.
