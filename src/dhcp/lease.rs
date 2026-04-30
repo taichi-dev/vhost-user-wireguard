@@ -181,6 +181,10 @@ impl LeaseStore {
         });
         self.probation.retain(|_, until| *until > now);
     }
+
+    pub(crate) fn leases_for_snapshot(&self) -> impl Iterator<Item = &Lease> {
+        self.leases.values()
+    }
 }
 
 #[cfg(test)]

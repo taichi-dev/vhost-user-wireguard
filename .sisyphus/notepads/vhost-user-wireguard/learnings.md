@@ -138,3 +138,163 @@
 - ARP for IPv4/Ethernet is always 28 bytes fixed
 - `cargo test --lib wire` ran 12 tests (3 per module), all passed
 - No new Cargo.toml dependencies needed — only `std::net::Ipv4Addr` from std
+
+## T12: TOML loader (src/config/toml.rs)
+
+- `ConfigError::FileRead` is a struct variant `{ path: PathBuf, source: io::Error }`, NOT a tuple — must use named fields when constructing it.
+- `Dhcp.reservations: Vec<DhcpReservation>` has no `#[serde(default)]`, so the minimal valid TOML must include `reservations = []` explicitly.
+- `toml::from_str::<Config>` returns `toml::de::Error` which implements `From` for `ConfigError::TomlParse` via `#[from]`, so `?` works directly.
+- `deny_unknown_fields` on all structs means top-level unknown keys (e.g. `unknown_key = "oops"`) cause a `TomlParse` error — confirmed by test.
+- `tempfile::NamedTempFile` is already in dev-dependencies; use `write_all` then pass `.path()` to `load()`.
+
+## T13: config/cli.rs — clap CLI override layer (2026-04-30)
+
+- `#[derive(clap::Parser, Debug, Default)]` on CliArgs — Default needed for test construction with `..Default::default()`
+- `ip_network::Ipv4Network` and `mac_address::MacAddress` both implement `std::str::FromStr`, so clap parses them directly via `Option<Ipv4Network>` / `Option<MacAddress>` fields
+- Test module needs explicit imports: `use super::super::{Dhcp, DhcpPool, Network, VhostUser, Vm, Wireguard};` — `use super::*` only brings in `Config` and `CliArgs`/`apply_overrides` from cli.rs
+- Pre-existing compile errors in `src/wg/keys.rs` (`StaticSecret` not Debug) prevent `cargo test --lib` from running all tests; use `cargo test --lib 'config::cli'` to filter and compile only the needed subset
+- `cargo check` passes clean (0 errors, 0 warnings) after removing unused struct imports from the non-test scope
+- 3 tests pass: test_no_overrides_unchanged, test_socket_override, test_listen_port_override
+
+## T14: WireGuard Key Loader (keys.rs)
+
+- `x25519_dalek::StaticSecret` does NOT implement `Debug` — avoid `{:?}` in assert messages for `Result<StaticSecret, _>`; use `.is_ok()` / `.is_err()` / `matches!()` without debug format
+- `WgError::KeyBase64` uses `#[from] base64::DecodeError` — the `?` operator on `STANDARD.decode()` auto-converts via From, no manual mapping needed
+- `WgError::KeyFileRead` has named fields `{ path, source }` — not a tuple variant
+- `rustix::fs::stat()` returns `Stat` with `st_mode: u32`; mask with `& 0o077` to check group/world bits
+- `rustix::fs::RawOsError` → `std::io::Error::from_raw_os_error(e.raw_os_error())` for conversion
+- For test file permissions: `std::os::unix::fs::PermissionsExt` + `std::fs::set_permissions` works fine (rustix not needed in tests)
+- `tempfile::NamedTempFile` keeps file alive while handle is in scope — assign to variable, not `_`
+
+## T16: Atomic-write JSON lease persistence (src/dhcp/persist.rs)
+
+- `DhcpError::LeaseFileIo` is a struct variant `{ path: PathBuf, source: io::Error }` — NOT a tuple variant; must use named fields
+- `DhcpError::LeaseFileVersion` is a struct variant `{ version: u32 }` — NOT a unit variant; must pass `{ version: snap.version }`
+- `SystemTime` has no serde support by default — use a custom `mod serde_system_time` with `serialize`/`deserialize` fns and `#[serde(with = "serde_system_time")]` on each `SystemTime` field
+- `LeaseState` enum variants with `SystemTime` fields each need `#[serde(with = "serde_system_time")]` on the field individually
+- Atomic write pattern: write to `<path>.tmp` → `sync_all()` → `fs::rename()` → open parent dir → `sync_all()` on dir
+- `fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)` for creating parent dir with Unix permissions
+- `std::os::unix::fs::DirBuilderExt` must be imported for `.mode()` on `DirBuilder`
+- Corrupt file rename: `path.with_extension(format!("corrupt.{ts}"))` — note this replaces the existing extension; for `leases.json` it produces `leases.corrupt.TIMESTAMP` (not `leases.json.corrupt.TIMESTAMP`)
+- `cargo test --lib dhcp::persist` compiles only the needed subset — passes even when other modules (options.rs) have pre-existing errors
+- Pre-existing `cargo check` failure in `src/dhcp/options.rs` (`unresolved import ipnet`) is NOT caused by T16 changes
+- 5 tests pass: roundtrip, missing_file, corrupt_json, wrong_version, atomic_write
+
+## T19: ops/logging.rs — tracing-subscriber setup
+
+- `LoggingError::InvalidFilter` has named fields `{ filter: String, source: ParseError }`, not a tuple variant — must use struct syntax when constructing.
+- `tracing_subscriber::fmt().json().with_env_filter(filter).try_init()` returns `Result<(), impl Error>` — map_err to `LoggingError::AlreadyInstalled`.
+- Global subscriber can only be set once per process; tests must accept `AlreadyInstalled` as a valid outcome on second call.
+- Pre-existing compilation errors in `src/dhcp/options.rs` (E0507 move errors) and `src/ops/systemd.rs` (E0133 unsafe env var calls) block `cargo test` for the whole crate — not caused by logging.rs.
+- `cargo check 2>&1 | grep "ops/logging"` returns empty = no errors in our file.
+
+## T17: ARP responder (src/arp/mod.rs) — 2026-04-30
+
+- ARP/Ethernet constants: `ETHERTYPE_ARP = 0x0806`, `ARP_OPERATION_REQUEST = 1`.
+- `handle_arp_request` is a pure function: `&[u8] → Option<Vec<u8>>` — no I/O, no state.
+- Flow: parse EthFrame → check ethertype=ARP → parse ArpPacket → check operation=REQUEST → check target_ip=gateway → build_arp_reply (sender=gateway, target=requester) → build_eth_frame (dst=vm_mac, src=gateway_mac).
+- `?` operator on `EthFrame::new` and `ArpPacket::new` naturally handles malformed frames (returns `None`).
+- 6 tests pass: gateway request returns reply, other IP ignored, ARP reply ignored, non-ARP ethertype ignored, malformed ETH frame, malformed ARP packet.
+- `build_raw_arp_request` and `build_raw_eth_frame` test helpers replicate minimal wire format to avoid coupling test to production builders.
+- `cargo test --lib arp` runs 6 tests + 3 existing wire/arp tests = 9 total, all passing.
+- `cargo check` passes clean.
+
+## T21: systemd.rs — sd_notify integration
+
+- `sd_notify::notify(false, &[NotifyState::Ready])` returns `Ok(false)` when NOTIFY_SOCKET is not set — treat as success, not error.
+- All notify functions are best-effort: log warnings on error, always return `Ok(())`.
+- `WATCHDOG_USEC` env var holds microseconds; return `Duration::from_micros(usec / 2)` for half-interval pinging.
+- Rust 2024 edition: `std::env::set_var` and `remove_var` are now `unsafe` — wrap in `unsafe {}` blocks in tests.
+- `cargo test --lib ops::systemd` filters correctly to run only that module's tests.
+
+## T15: DhcpOptionsBuilder (src/dhcp/options.rs) (2026-04-30)
+
+- `ipnet` is a transitive dep of `dhcproto` but must be added explicitly to Cargo.toml to use directly
+- `dhcproto::v4::DhcpOption::ClasslessStaticRoute` takes `Vec<(ipnet::Ipv4Net, Ipv4Addr)>` — typed, not raw bytes
+- `ip_network::Ipv4Network::netmask()` returns `u8` (prefix length), NOT `Ipv4Addr` — name is misleading
+- `ip_network::Ipv4Network::network_address()` returns `Ipv4Addr`
+- `ipnet::Ipv4Net::new(addr: Ipv4Addr, prefix_len: u8)` — conversion from ip_network to ipnet is straightforward
+- Builder pattern: methods must take `self` (not `&mut self`) and return `Self` for chaining to work with `build(self)`
+- `dhcproto::v4::DhcpOption` variants: `Renewal` (58), `Rebinding` (59) — NOT `RenewalTime`/`RebindingTime`
+- `DhcpOptions::get(OptionCode::X)` returns `Option<&DhcpOption>` — use for presence checks
+- Broadcast address formula: `(gateway & mask) | !mask` — works cleanly with `u32::from(Ipv4Addr)`
+- 6 tests pass: ack_has_lease_options, inform_excludes_lease_options, classless_routes_24, classless_routes_default, nak_has_message, builder_chaining
+
+## T20: ops/caps.rs — Capability dropping and privilege reduction
+
+- `rustix 0.38` has `setuid`/`setgid` in `rustix::thread::{set_thread_uid, set_thread_gid}` (NOT in `rustix::process`) — gated behind the `thread` feature
+- `Uid`/`Gid` types are re-exported from `rustix::thread::{Uid, Gid}`; `rustix::ugid` is private
+- `rustix::thread::Uid::from_raw(uid)` and `Gid::from_raw(gid)` are `unsafe` because they require a valid uid/gid value
+- `rustix` functions return `rustix::io::Errno` (NOT `std::io::Error`) — call `.into()` to convert
+- `rustix::thread::set_no_new_privs(bool)` is available for `PR_SET_NO_NEW_PRIVS`
+- `caps::clear(None, CapSet::*)` clears capability sets for the current process; returns `CapsError` which implements `Display`
+- `CapsError` tuple field is `pub(crate)` — can't access directly; use `e.to_string()` for error messages
+- User/group lookup: parse `/etc/passwd` and `/etc/group` manually (line by line, colon-separated) since rustix has no `getpwnam`/`getgrnam`
+- setgid MUST be called before setuid (can't setgid after dropping root privilege)
+- 4 tests pass: test_drop_capabilities_no_panic, test_drop_privileges_no_user_no_group, test_drop_privileges_unknown_user, test_drop_privileges_unknown_group
+
+## T18: ICMPv4 Type 3 Code 4 PMTU Generator (src/wire/icmp.rs)
+
+- `build_icmp_frag_needed(original_ip_packet, next_hop_mtu, src_ip) -> Vec<u8>` builds a complete IPv4/ICMPv4 packet
+- ICMP payload = original IP header + first 8 bytes of original IP payload (RFC 792)
+- ICMP header layout: type(1) code(1) checksum(2) unused(2) next_hop_mtu(2)
+- IPv4 wrapper: version=4, IHL=5, TTL=64, proto=1, src=gateway IP, dst=original sender IP
+- Internet checksum: one's complement sum of 16-bit words; verifying a valid packet yields 0
+- Pre-existing compile errors in src/ops/caps.rs (rustix Errno type mismatch) do not affect wire module tests
+- `cargo test --lib wire::icmp` runs successfully in isolation despite top-level compile errors
+
+## T24: Peer wrapper (src/wg/peer.rs) (2026-04-30)
+
+- `boringtun::noise::Tunn::new(static_private, peer_public, preshared_key, persistent_keepalive: Option<u16>, index: u32, rate_limiter: Option<Arc<RateLimiter>>) -> Self` is INFALLIBLE.
+  - `persistent_keepalive` is `Option<u16>` (NOT `Option<u32>` as the plan hinted) — pass through directly with no `.map(|k| k as u32)` cast.
+- `boringtun::noise::TunnResult` variants (lifetime `'a` on the buffer): `Done`, `Err(WireGuardError)`, `WriteToNetwork(&'a mut [u8])`, `WriteToTunnelV4(&'a mut [u8], Ipv4Addr)`, `WriteToTunnelV6(&'a mut [u8], Ipv6Addr)`.
+- `RateLimiter::new(public_key: &PublicKey, limit: u64) -> Self` returns `Self` (NOT `Arc<Self>`); caller must `Arc::new(...)`.
+- `x25519_dalek::StaticSecret` derives `Clone` (under `static_secrets` feature), so `our_static_secret.clone()` works for moving into `Tunn::new` while keeping the original.
+- `x25519_dalek::PublicKey: Copy` — pass by value freely.
+- `ip_network::IpNetwork::contains<I: Into<IpAddr>>(&self, ip: I) -> bool` — works directly with `IpAddr::V4(ipv4_addr)`.
+- Drain pattern uses `tunn.decapsulate(None, &[], out)` — empty datagram triggers `send_queued_packet`. Real traffic MUST pass `Some(src_addr.ip())` (rate limiter uses it).
+- `current_endpoint`/`last_decap_at` updates ONLY fire on `WriteToTunnelV4` (data-plane after established session). Handshake responses produce `WriteToNetwork` and do NOT update endpoint — verified by test.
+- Returning enums with `usize` (not `&'a mut [u8]`) avoids leaking the mut borrow of the output buffer through the Peer methods, so callers can use `out` after the call without lifetime gymnastics.
+- `WireGuardError::ConnectionExpired` is the specific variant from `update_timers` that signals session death; all other Err variants from update_timers are best-mapped to `Done`.
+- 8 tests pass: new_peer_created, allowed_ip_check_match, allowed_ip_check_no_match, encapsulate_produces_output, decapsulate_updates_endpoint, drain_returns_done, update_timers_no_panic, decapsulate_invalid_returns_err.
+
+## T22: config/validate.rs — semantic validation collecting all issues (2026-04-30)
+
+- `ip_network::Ipv4Network` has NO `prefix_len()` method — the prefix length is returned by `.netmask() -> u8` (name is misleading). Confirmed with source at `~/.cargo/registry/src/.../ip_network-0.4.1/src/ipv4_network.rs:140`.
+- `Ipv4Network::network_address() -> Ipv4Addr` and `broadcast_address() -> Ipv4Addr` both work as expected for /30. For /31 the broadcast equals the second host (no distinction).
+- `Ipv4Network::contains(ip)` includes BOTH the network and broadcast address — must filter those out separately (e.g. for `dhcp.pool.start != network_addr`).
+- `mac_address::MacAddress` derives `Hash + Eq + Copy`, so `HashSet<MacAddress>` works directly for dedup.
+- `MacAddress` Display uppercases hex (e.g. `52:54:00:AA:BB:CC` not `aa:bb:cc`) — keep test expectations uppercase.
+- `Path::parent()` returns `Some("")` for relative bare filenames; check `parent.as_os_str().is_empty()` before calling `.exists()` to avoid spurious "does not exist" failures.
+- `u16::is_power_of_two()` is provided directly by std for primitive integer types (no extra trait import).
+- Validation pattern: collect issues into `Vec<String>`, run ALL checks unconditionally, return `Err(ConfigError::Validation { issues })` only at the end. Lets users see every problem in a single error report.
+- For deduplicated string fingerprints (WG public keys), `HashSet<&str>` over `&peer.public_key.as_str()` avoids cloning while iterating.
+- 30 tests pass: 1 happy-path, 16 rejection paths (one per check) plus multiple sub-cases (gateway=net OR gateway=bcast, mtu high vs low, queue_size three failure modes, both/neither WG keys), and a multi-issue test that asserts ≥4 issues collected at once.
+- `cargo test --lib 'config::validate'` runs the filtered test set; `cargo check` exits 0 with no new warnings.
+
+## T23: DhcpServer state machine (src/dhcp/mod.rs) — 2026-04-30
+
+- `dhcproto::v4::Message`: use `set_opcode(Opcode::BootReply)`, `set_chaddr(&[u8])`, `set_yiaddr/set_ciaddr/set_giaddr/set_siaddr`, `set_xid`, `set_secs`, `set_flags`, `set_opts(DhcpOptions)`, `set_htype(HType::Eth)`.
+- `Message::default()` sets opcode to `BootRequest` and gives a random `xid` — must override opcode when building replies.
+- `dhcproto::v4::Flags::default().set_broadcast()` builds flag with broadcast bit set; `flags.broadcast() -> bool` reads it.
+- `DhcpOptions::msg_type() -> Option<MessageType>` is the cleanest way to dispatch on option 53 (instead of matching on `get(OptionCode::MessageType)`).
+- For `OptionCode::RequestedIpAddress` extraction: `match opts.get(OptionCode::RequestedIpAddress) { Some(DhcpOption::RequestedIpAddress(ip)) => Some(*ip), _ => None }`.
+- DHCP REQUEST flavor dispatch (RFC 2131 §4.3.2):
+  - SELECTING: option 54 set + option 50 set
+  - INIT-REBOOT: no option 54, option 50 set, ciaddr=0 — match against existing lease, else NAK
+  - RENEWING/REBINDING: no option 54, no option 50, ciaddr set — distinguish reply unicast/broadcast by `flags.broadcast()` (clients set this bit when broadcasting)
+- For NAK: ALWAYS broadcast per RFC 2131 §4.3.2; set broadcast flag on the reply.
+- For RENEWING ACK: unicast to ciaddr (not yiaddr=0; yiaddr stays as the lease IP).
+- IPv4 header checksum: one's complement sum of 16-bit big-endian words, fold carries until ≤16 bits, then bitwise-NOT. Handles odd-length headers via shift-left-by-8 padding (not needed for fixed 20-byte IPv4 header but defensive).
+- IPv4 prefix → subnet mask: `Ipv4Addr::from(!((1u32 << (32 - prefix_len)) - 1))`. Special-case `prefix_len == 0` (avoid `1u32 << 32` UB) and `>= 32` (return 255.255.255.255).
+- `ip_network::Ipv4Network::broadcast_address()` returns the broadcast IP directly — simpler than computing it manually.
+- UDP checksum is OPTIONAL for IPv4 — sending zero is RFC-compliant (RFC 768) and avoids the pseudo-header complexity. Receivers see this as "no checksum" and skip verification.
+- `dhcproto::v4::Encoder::new(&mut buf)` borrows mutably; wrap in a `{ ... }` scope so the borrow drops before re-using `buf`.
+- `Message::chaddr() -> &[u8]` returns slice of length `hlen` (typically 6 for Ethernet); convert to `[u8;6]` defensively with length check.
+- For tests: `mac_address::MacAddress::from([u8; 6])` works directly; `MacAddress::bytes() -> [u8; 6]` returns the raw bytes.
+- `DhcpServer::new` takes `Vm` struct (gets both `mac` and `mtu`) — cleaner than separate `vm_mac` + `mtu` fields. Spec said "add vm_mac as a field" but passing the whole `Vm` is cleaner since MTU is also needed for option 26.
+- `tempfile::TempDir` for tests — leases.json path doesn't exist yet, so `LeaseFile::load()` returns empty snapshot.
+- `LeaseStore::leases_for_snapshot()` added as `pub(crate)` helper to expose lease iteration for `checkpoint()` without leaking internal HashMap.
+- 13 dhcp::tests pass: discover→offer, selecting→ack, init-reboot match→ack, init-reboot mismatch→nak, renewing unicast ack, rebinding broadcast ack, decline→probation, release→released, inform excludes lease opts, chaddr mismatch drops, unknown msg type drops, full DORA, checkpoint persists.
+- `cargo check` clean; `cargo test --lib dhcp` 30 tests pass (5 lease + 6 options + 5 persist + 13 mod + 1 covered persist).
+- Pre-existing clippy errors in `src/wg/routing.rs` (unwrap in tests) do not affect dhcp module — all my unwraps are inside `#[cfg(test)] mod tests`.
