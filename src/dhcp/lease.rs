@@ -9,19 +9,42 @@ use std::time::{Duration, SystemTime};
 use crate::error::DhcpError;
 
 /// State of a DHCP lease.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum LeaseState {
-    Offered { expires_at: SystemTime },
-    Bound { expires_at: SystemTime },
+    Offered {
+        #[serde(with = "serde_system_time")]
+        expires_at: SystemTime,
+    },
+    Bound {
+        #[serde(with = "serde_system_time")]
+        expires_at: SystemTime,
+    },
     Released,
-    Probation { until: SystemTime },
+    Probation {
+        #[serde(with = "serde_system_time")]
+        until: SystemTime,
+    },
 }
 
 /// A single DHCP lease record.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Lease {
     pub mac: [u8; 6],
     pub ip: Ipv4Addr,
     pub state: LeaseState,
     pub hostname: Option<String>,
+}
+
+mod serde_system_time {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(t: &SystemTime, s: S) -> Result<S::Ok, S::Error> {
+        t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs().serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<SystemTime, D::Error> {
+        let secs = u64::deserialize(d)?;
+        Ok(UNIX_EPOCH + Duration::from_secs(secs))
+    }
 }
 
 /// Manages DHCP lease allocation, binding, release, decline, and garbage collection.
