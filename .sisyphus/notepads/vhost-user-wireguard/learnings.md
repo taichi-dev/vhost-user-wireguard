@@ -298,3 +298,33 @@
 - 13 dhcp::tests pass: discover→offer, selecting→ack, init-reboot match→ack, init-reboot mismatch→nak, renewing unicast ack, rebinding broadcast ack, decline→probation, release→released, inform excludes lease opts, chaddr mismatch drops, unknown msg type drops, full DORA, checkpoint persists.
 - `cargo check` clean; `cargo test --lib dhcp` 30 tests pass (5 lease + 6 options + 5 persist + 13 mod + 1 covered persist).
 - Pre-existing clippy errors in `src/wg/routing.rs` (unwrap in tests) do not affect dhcp module — all my unwraps are inside `#[cfg(test)] mod tests`.
+
+## T25: src/wg/mod.rs (WgEngine) — 2026-04-30
+
+### vmm_sys_util 0.15 TimerFd API divergence from task spec
+- Task spec referenced `TimerFd::new_custom(ClockId::Monotonic, false, false)` — this method does NOT exist in vmm_sys_util 0.15.
+- `TimerFd::new()` is the correct API; it always uses `CLOCK_MONOTONIC | TFD_CLOEXEC` internally.
+- Task spec referenced `timer_fd.read()` — actual API is `timer_fd.wait()` (returns `u64` of expirations; blocks if not yet expired, returns immediately when readable from epoll loop).
+- Verified CLOCK_MONOTONIC at runtime by reading `/proc/self/fdinfo/<fd>` and asserting `clockid: 1`.
+
+### Linux `IPV6_V6ONLY` MUST precede `bind(2)`
+- `UdpSocket::bind("[::]:0")` followed by `set_ipv6_v6only(&socket, false)` returns `EINVAL` (errno 22).
+- Workaround: build the socket via `rustix::net::socket(INET6, DGRAM, None)` → `set_ipv6_v6only(&fd, false)` → `rustix::net::bind(&fd, &addr)` → `UdpSocket::from(owned_fd)`.
+- `std::net::UdpSocket: From<OwnedFd>` enables zero-copy hand-off after low-level setup.
+- `rustix::net::SocketAddr` is re-exported from `core::net::SocketAddr` (same type as `std::net::SocketAddr`); pass `SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0))` to `rustix::net::bind`.
+
+### boringtun receiver_idx encoding
+- `Tunn::new(... index: u32 ...)` stores `index << 8` as the seed for boringtun's local index allocator.
+- Concrete consequence: for any incoming non-handshake-init datagram, `receiver_idx >> 8 == peer_idx_we_passed`. Used as a cheap lookup hint when `recv_idx_to_peer` cache is cold.
+- HandshakeInit messages have NO receiver_idx field (only sender_idx) — single-peer fast path or `parse_handshake_anon` enumeration is required.
+
+### rustix Errno ↔ std::io::Error
+- `rustix::io::Errno: Into<std::io::Error>` — use `e.into()` directly, no manual `from_raw_os_error`.
+- `vmm_sys_util::errno::Error` is NOT directly convertible; use `std::io::Error::from_raw_os_error(e.errno())`.
+
+### Public key parsing reuses preshared parser
+- `parse_preshared_key_base64` returns `[u8; 32]` which is exactly what `x25519_dalek::PublicKey::from([u8;32])` consumes.
+- Avoids a redundant `parse_public_key_base64` helper in `wg::keys`.
+
+### WgError::PeerNotFound semantics
+- The `index: usize` field is currently used loosely — for "no route found" we pass `0` as a sentinel. Future revision could add a `NoRoute { dst_ip }` variant for clarity (out of T25 scope: error.rs untouched).
