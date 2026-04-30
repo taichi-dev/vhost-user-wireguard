@@ -301,10 +301,15 @@ impl<'a, M: GuestMemory> RxProcessor<'a, M> {
 }
 
 /// TX-side processor: drains the TX vring, classifies, and dispatches.
-pub struct TxProcessor<'a, M: GuestMemory> {
+///
+/// `'r` is the (potentially-shorter) lifetime of the `&mut RxProcessor` reborrow,
+/// kept distinct from the inner data lifetime `'a` so callers can drop the
+/// `TxProcessor` and still access the `RxProcessor` afterwards (e.g. to
+/// recover the queued frames it accumulated).
+pub struct TxProcessor<'r, 'a, M: GuestMemory> {
     pub vring: &'a VringRwLock,
     pub mem: &'a M,
-    pub rx: &'a mut RxProcessor<'a, M>,
+    pub rx: &'r mut RxProcessor<'a, M>,
     pub intercept_cfg: &'a InterceptCfg,
     pub router: &'a AllowedIpsRouter,
     pub dhcp: &'a mut DhcpServer,
@@ -314,7 +319,7 @@ pub struct TxProcessor<'a, M: GuestMemory> {
     pub gateway_ip: Ipv4Addr,
 }
 
-impl<'a, M: GuestMemory> TxProcessor<'a, M> {
+impl<'r, 'a, M: GuestMemory> TxProcessor<'r, 'a, M> {
     /// Run the full `EVENT_IDX`-correct drain loop on the TX vring.
     ///
     /// This is the entrypoint invoked from the worker on every TX kick. It

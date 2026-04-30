@@ -632,3 +632,56 @@ With `#[ignore = "reason"]` on test 4, `cargo test --test integration_arp` exits
 - `cargo test --test integration_arp` — 3 passed, 0 failed, 1 ignored (test 4 awaits gratuitous-ARP feature).
 - `cargo test --lib` — 161/161 still pass.
 - `cargo clippy --test integration_arp -- -A clippy::never_loop` — 0 warnings on integration_arp.rs (the 2 warnings hit are pre-existing in tests/common/mod.rs: `is_multiple_of` MSRV nit and `useless_conversion` on QUEUE_SIZE).
+
+## T33 (WireGuard handshake + datapath integration tests) — 2026-04-30
+
+### Production bug uncovered: `run_serve_loop` did NOT register external fds
+`src/datapath/mod.rs::run_serve_loop` previously called `daemon.serve(socket_path)` directly. `VhostUserDaemon::serve` is the convenience wrapper that bundles `start + wait` into one blocking call — there is no window in which to register the WG UDP socket, the 1 Hz timerfd, or the externally-driven exit fd with the framework's freshly-built `VringEpollHandler`. Result: the daemon's epoll loop only dispatched events from the two virtqueues; inbound UDP datagrams sat unread on the kernel buffer. Every WG end-to-end path (handshake, decap, drain, roaming, rate-limit) was effectively dead code under integration tests. Fix: replace `serve` with the explicit sequence `Listener::new` → `daemon.start(&mut listener)` → `daemon.get_epoll_handlers()` → `register_external_fds(&handler, ...)` for every handler → `daemon.wait()`. Disconnect-shaped errors are still coerced to `Ok(())` (matching `serve`'s tolerance for `Disconnected` / `PartialMessage`). The pre-existing `register_external_fds` function in the same module already had the right body — it just had zero call sites in production code.
+
+### `VhostUserDaemon::handler` field is private — `send_exit_event` is unreachable from callers
+`serve()` ends with `self.handler.lock().unwrap().send_exit_event()` to nudge any spawned worker threads, but `handler` is a private field on `VhostUserDaemon` (vhost-user-backend 0.22.0). External callers reproducing the start/wait split CANNOT call this. Safe to omit because (a) `daemon.wait()` already blocks until the worker has joined, so by the time we'd send the exit event the worker is gone; (b) our own `EXTRA_TOKEN_EXIT` fd inside the backend is what callers actually use to terminate the loop. The `send_exit_event` path is purely defensive against multi-threaded backends, which we don't have.
+
+### Integration tests: cargo runs each test BINARY sequentially, but tests within a binary in parallel
+Confirmed by reading the runner output (`Running tests/integration_arp.rs` … `Running tests/integration_dhcp.rs` …). This means the per-binary `static PORT_ALLOCATOR: AtomicU16 = AtomicU16::new(51820)` in `tests/common/mod.rs` reliably gives unique ports within one binary, and there's no cross-binary collision because the binaries don't run concurrently. We could safely use the same allocator for both the daemon's listen port AND the fake peer's UDP port in `integration_wg.rs`.
+
+### `MockVhostUserMaster::spawn_with_config_template` substitutes 4 placeholders
+`{wg_priv}` ← `fake_wg_key(0x11)`, `{wg_peer_pub}` ← `fake_wg_key(0x22)`, `{wg_port}` ← `alloc_listen_port()`, `{vu_socket}` ← work-tempdir socket. WG tests need REAL X25519 keys (the fake keys are 32-byte constants that survive `parse_private_key_base64` but yield deterministic-and-shared identities), so the integration_wg helper builds a TOML template with the real keys baked in via `format!()` and only `{vu_socket}` left as a harness-substituted placeholder. The other three substitutions become no-ops because the placeholders are absent from the rendered template — `String::replace` is a silent no-op when the needle is missing.
+
+### Daemon's per-peer endpoint is the configured one until first IPv4 decap
+`Peer::current_endpoint` only updates inside `decapsulate` on the `WriteToTunnelV4` arm (`src/wg/peer.rs:148`). For handshake init/response decapsulation, current_endpoint stays at the configured `[wireguard.peers].endpoint` — meaning the daemon's HandshakeResponse is sent to the configured port, NOT the source port of the inbound init. Tests that initiate handshakes from the fake peer side MUST configure `endpoint = "127.0.0.1:<fake_peer_port>"` to receive the response. Roaming tests verify this exact mechanism: they trigger a `WriteToTunnelV4` from src=A, then from src=B, and observe that subsequent daemon→peer traffic follows the most recent IPv4 decap source.
+
+### Bootstrap order for tests that exercise both directions
+1. Fake peer initiates handshake (calls `Tunn::format_handshake_initiation`, sends to daemon's listen port).
+2. Daemon decapsulates init, replies with HandshakeResponse to configured endpoint.
+3. Fake peer decapsulates response — boringtun's `handle_handshake_response` returns `WriteToNetwork` containing an empty-payload keepalive that establishes the session on the responder side.
+4. Either side can now `encapsulate` data packets and have them decode.
+
+If the test does NOT need both directions (e.g. handshake-only tests, drain-loop tests where the daemon initiates), the bootstrap can be skipped or shortened.
+
+### Drain loop verification: count `WriteToTunnelV4` results, not raw datagrams
+After daemon decapsulates a HandshakeResponse, it emits a session keepalive (32 bytes ciphertext, 0-byte plaintext) followed by every queued data packet. The keepalive's plaintext is empty, so `Tunn::validate_decapsulated_packet` returns `TunnResult::Done`. Counting `WriteToTunnelV4` results from the fake peer's decap calls yields exactly the data-packet count, ignoring the keepalive. boringtun's `decapsulate(None, &[], dst)` is the canonical drain call — loop until `Done`.
+
+### Rate limiter: count >= limit AFTER the increment-and-return
+`RateLimiter::is_under_load(&self) -> bool` does `self.count.fetch_add(1, ...) >= self.limit`. This is "count BEFORE increment >= limit". With limit=10, calls 1..=10 see counts 0..=9 and return false; call 11 sees count=10 and returns true. So the daemon emits 10 valid `HandshakeResponse`s and then switches to `CookieReply` for the rest of the second. AC-WG-4 verifies this: ≤10 responses, ≥1 cookie reply, no other message types. The ratelimiter's count resets every `RESET_PERIOD` (1 s) inside `update_timers` via `reset_count()` — irrelevant to a single-second flood test.
+
+### Trust-boundary anti-spoof requires DORA before any tunnel-bound TX
+`intercept::classify` rejects any TX frame whose IP src is neither `0.0.0.0` nor the active DHCP lease (`Drop(SrcIpSpoofed)`, `src/datapath/intercept.rs:167`). Tests that need the VM to send IPv4 traffic to the WG-routed range MUST run a full DORA first: `test_icmp_echo_through_tunnel`, `test_endpoint_roaming`, and `test_decap_drain_loop` all call a shared `run_dora()` helper before any TX. Tests that only exercise the inbound path (handshake, allowed-ips, flood, v6, clock-jump) skip DORA.
+
+### `boringtun::format_handshake_initiation(force_resend=true)` re-rolls the ephemeral
+Each call generates a fresh ephemeral key pair (`x25519::ReusableSecret::random_from_rng(OsRng)`) and a fresh `local_index`. So 1000 calls = 1000 valid, distinct `HandshakeInit` messages. This is what makes the flood test possible from a SINGLE Tunn — no need to construct 1000 separate Tunns.
+
+### `Tunn::encapsulate` queues the plaintext AND emits an init when no session
+Per boringtun source: when `encapsulate` is called without a session it pushes the plaintext onto an internal `packet_queue` (max 256) AND calls `format_handshake_initiation(false)`. The first call returns `WriteToNetwork(init)`; subsequent calls return `Done` because a handshake is already in progress (the `force_resend=false` flag respects in-flight handshakes). For the daemon's `WgEngine::handle_tx_ip_packet`, this means a flurry of TX packets each queues one packet but only the FIRST sends an init to the wire. After the response decapsulates on the daemon side, the drain loop emits all queued packets.
+
+### IPv6 handling: drop with no counter visible from outside the daemon
+`Peer::decapsulate` maps `TunnResult::WriteToTunnelV6` to `DecapResult::Done` (`src/wg/peer.rs:159`). There's no counter increment exposed via `Counters` — the only externally observable behaviour is "RX queue stays empty". The integration test asserts exactly this. If we wanted to count v6 drops, we'd need a new counter wired through `WgEngine::handle_socket_readable` into the `Counters` struct; that's deferred.
+
+### `recv_from` on a v6 dual-stack daemon socket reports v4-mapped IPv6 sources
+The daemon binds `[::]:port` with `IPV6_V6ONLY=0`. When a fake peer at `127.0.0.1:port` sends a UDP datagram, the daemon's `socket.recv_from(&mut buf)` returns `src_addr = ::ffff:127.0.0.1:port` (a v4-mapped v6 SocketAddr). Pass `Some(src_addr.ip())` to `Tunn::decapsulate` — boringtun's RateLimiter cookie verification masks the v4-mapped portion correctly via `match addr { IpAddr::V4 => …, IpAddr::V6 => … }` in `current_cookie`. Tests on the FAKE PEER side bind v4-only sockets, so they observe v4 sources directly — no asymmetry to reason about.
+
+### Verification (T33)
+- `cargo test --test integration_wg` — 8/8 pass in ~3.2 s (3 consecutive runs all clean).
+- `cargo test --lib` — 161/161 still pass.
+- `cargo test --tests` (full integration suite: smoke + arp + dhcp + wg) — 21/21 pass + 1 ignored (the pre-existing gratuitous-ARP placeholder from T32).
+- `cargo clippy --test integration_wg -- -A clippy::never_loop` — 0 warnings on `tests/integration_wg.rs`. Pre-existing warnings in `tests/common/mod.rs` (MSRV nit, useless conversion) and `src/*` (manual range, map_or, io::Error::other, never_loop) are unchanged.
+- Production change: `src/datapath/mod.rs::run_serve_loop` now calls `start + register_external_fds + wait` instead of `serve`. This wires up the WG UDP socket, the 1 Hz timerfd, and the exit fd with the framework's `VringEpollHandler`, fixing the dead-code bug noted in T30 wisdom. Backward-compatible: the function signature is unchanged (the `_backend` parameter is now `backend` and is actually used to read the three fds before start).
