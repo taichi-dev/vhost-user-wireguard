@@ -1791,6 +1791,7 @@ dependencies = [
  "dhcproto",
  "ip_network",
  "ip_network_table",
+ "ipnet",
  "mac_address",
  "predicates",
  "rand 0.8.6",
