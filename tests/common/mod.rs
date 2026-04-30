@@ -595,14 +595,14 @@ impl MockVhostUserMaster {
     /// negotiation, and pre-publish RX descriptors so the daemon has buffer
     /// space waiting.
     pub fn spawn() -> Self {
-        Self::spawn_with_options(CONFIG_TEMPLATE, None, None)
+        Self::spawn_with_options(CONFIG_TEMPLATE, None, None, None)
     }
 
     /// Spawn variant that uses a custom TOML template. The template still
     /// gets the standard `{wg_priv}`, `{wg_port}`, `{wg_peer_pub}`, and
     /// `{vu_socket}` substitutions applied.
     pub fn spawn_with_config_template(template: &str) -> Self {
-        Self::spawn_with_options(template, None, None)
+        Self::spawn_with_options(template, None, None, None)
     }
 
     /// Spawn variant that pre-seeds the daemon's lease file with the given
@@ -610,7 +610,7 @@ impl MockVhostUserMaster {
     /// the daemon starts, so it is loaded into the in-memory lease store
     /// during DhcpServer construction.
     pub fn spawn_with_seeded_lease(seed_lease_json: &str) -> Self {
-        Self::spawn_with_options(CONFIG_TEMPLATE, Some(seed_lease_json), None)
+        Self::spawn_with_options(CONFIG_TEMPLATE, Some(seed_lease_json), None, None)
     }
 
     /// Spawn variant that explicitly sets the daemon's `RUST_LOG` filter,
@@ -618,13 +618,21 @@ impl MockVhostUserMaster {
     /// Used by tests that need to capture daemon log output (for example,
     /// the secret-leakage detector in `integration_sec.rs`).
     pub fn spawn_with_log_filter(template: &str, log_filter: &str) -> Self {
-        Self::spawn_with_options(template, None, Some(log_filter))
+        Self::spawn_with_options(template, None, Some(log_filter), None)
+    }
+
+    /// Spawn variant that points the daemon's `NOTIFY_SOCKET` at a fake
+    /// systemd notify socket. Used by the sd_notify smoke tests to capture
+    /// `READY=1` / `STOPPING=1` lines without needing a real PID 1.
+    pub fn spawn_with_notify_socket(notify_path: &Path) -> Self {
+        Self::spawn_with_options(CONFIG_TEMPLATE, None, Some("trace"), Some(notify_path))
     }
 
     fn spawn_with_options(
         template: &str,
         seed_lease_json: Option<&str>,
         log_filter_override: Option<&str>,
+        notify_socket: Option<&Path>,
     ) -> Self {
         let work_dir = tempfile::Builder::new()
             .prefix("vuwg-test-")
@@ -658,7 +666,14 @@ impl MockVhostUserMaster {
         if log_filter != "off" {
             command.arg("--log-filter").arg(&log_filter);
         }
-        command.env_remove("NOTIFY_SOCKET");
+        match notify_socket {
+            Some(path) => {
+                command.env("NOTIFY_SOCKET", path);
+            }
+            None => {
+                command.env_remove("NOTIFY_SOCKET");
+            }
+        }
         command.env("RUST_LOG", &log_filter);
         command.env("VUWG_LEASE_PATH", &lease_path);
 
@@ -708,6 +723,46 @@ impl MockVhostUserMaster {
 
     pub fn stderr_path(&self) -> &Path {
         &self.stderr_path
+    }
+
+    /// Process ID of the currently-running daemon child. Returns `None`
+    /// only after [`Self::disconnect_and_reconnect`] has reaped the old
+    /// child and before the new one has been spawned, which is a window
+    /// the harness never exposes externally.
+    pub fn pid(&self) -> Option<u32> {
+        self.daemon.child.as_ref().map(|c| c.id())
+    }
+
+    /// Close the master-side vhost-user connection and let the daemon's
+    /// `serve()` loop unwind on its own — DO NOT call `child.kill()`. The
+    /// daemon then runs its full shutdown sequence (including
+    /// `notify_stopping`) before exiting. Used by `test_sd_notify_protocol`
+    /// where a SIGKILL would race past `STOPPING=1` and make the test flaky.
+    /// Returns `Ok(status)` if the daemon exited within `timeout`,
+    /// `Err(())` if it hung past the deadline (caller should escalate).
+    pub fn close_frontend_and_wait_for_clean_exit(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<std::process::ExitStatus, ()> {
+        self.frontend = None;
+        let deadline = Instant::now() + timeout;
+        let Some(mut child) = self.daemon.child.take() else {
+            return Err(());
+        };
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(());
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return Err(()),
+            }
+        }
     }
 
     pub fn read_daemon_stderr(&self) -> String {
@@ -932,6 +987,13 @@ impl MockVhostUserMaster {
     /// Re-publishes the descriptor before returning so the daemon always
     /// has buffers waiting.
     pub fn read_rx_frame(&mut self) -> Option<Vec<u8>> {
+        self.read_rx_frame_with_header().map(|(_, frame)| frame)
+    }
+
+    /// Same as [`Self::read_rx_frame`] but also returns the raw 12-byte
+    /// vnet_hdr the daemon wrote in front of the Ethernet payload. Used by
+    /// the AC-VU-3 smoke test to verify the header layout end-to-end.
+    pub fn read_rx_frame_with_header(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
         let target = self.rx.last_used_idx.wrapping_add(1);
         if wait_for_used_advance(&self.mem, &self.rx, target, Duration::from_secs(1))
             .is_err()
@@ -948,6 +1010,7 @@ impl MockVhostUserMaster {
             total >= VNET_HDR_LEN,
             "daemon wrote shorter than vnet_hdr: {total} bytes"
         );
+        let header = unsafe { self.mem.read_bytes(buf_addr, VNET_HDR_LEN) };
         let frame_len = total - VNET_HDR_LEN;
         let frame =
             unsafe { self.mem.read_bytes(buf_addr + VNET_HDR_LEN as u64, frame_len) };
@@ -962,7 +1025,7 @@ impl MockVhostUserMaster {
         self.rx.publish_avail(&self.mem, head);
         let _ = self.rx.kick.write(1);
 
-        Some(frame)
+        Some((header, frame))
     }
 }
 
