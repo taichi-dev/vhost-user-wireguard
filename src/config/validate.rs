@@ -51,7 +51,7 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
 
     // 4. MTU must be inside the legal range
     let mtu = config.vm.mtu;
-    if mtu < 576 || mtu > 9000 {
+    if !(576..=9000).contains(&mtu) {
         issues.push(format!("vm.mtu {n} out of range [576, 9000]", n = mtu));
     }
 
@@ -208,7 +208,7 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
 
     // 15. queue_size must be a power of two within [64, 4096]
     let qs = config.vhost_user.queue_size;
-    if !qs.is_power_of_two() || qs < 64 || qs > 4096 {
+    if !qs.is_power_of_two() || !(64..=4096).contains(&qs) {
         issues.push(format!(
             "vhost_user.queue_size {n} must be a power of 2 between 64 and 4096",
             n = qs,

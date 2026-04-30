@@ -100,7 +100,8 @@ pub fn run(cli: CliArgs) -> Result<(), Error> {
     //    success/failure on stdout, not structured logs interleaving.
     if cli.check_config {
         crate::config::validate::validate(&config)?;
-        println!("config OK");
+        #[allow(clippy::print_stdout)] // User-facing CLI output for --check-config; intentional stdout write
+        { println!("config OK"); }
         return Ok(());
     }
 
@@ -250,7 +251,7 @@ fn spawn_signal_thread(
     let handle = thread::Builder::new()
         .name("signal-handler".to_string())
         .spawn(move || {
-            for signal in signals.forever() {
+            if let Some(signal) = signals.forever().next() {
                 tracing::info!(signal, "received_shutdown_signal");
                 match backend.lock() {
                     Ok(b) => {
@@ -262,7 +263,6 @@ fn spawn_signal_thread(
                         tracing::error!(error = %e, "backend_mutex_poisoned_in_signal_thread");
                     }
                 }
-                break;
             }
         })?;
 

@@ -164,7 +164,7 @@ pub fn classify(
     //    or an exact match against the active DHCP lease; everything else is
     //    rejected.
     let src_ip = ip.src_ip();
-    if src_ip != Ipv4Addr::UNSPECIFIED && lease.map_or(true, |leased| src_ip != leased) {
+    if src_ip != Ipv4Addr::UNSPECIFIED && lease != Some(src_ip) {
         return InterceptDecision::Drop(DropReason::SrcIpSpoofed);
     }
 

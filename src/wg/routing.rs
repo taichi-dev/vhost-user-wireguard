@@ -8,6 +8,12 @@ pub struct AllowedIpsRouter {
     table: IpNetworkTable<usize>,
 }
 
+impl Default for AllowedIpsRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AllowedIpsRouter {
     pub fn new() -> Self {
         Self {

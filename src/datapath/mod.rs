@@ -445,31 +445,30 @@ impl VhostUserBackendMut for WgNetBackend {
         match device_event {
             RX_QUEUE_EVENT => self
                 .flush_rx(rx_vring)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string())),
+                .map_err(|e| io::Error::other(e.to_string())),
             TX_QUEUE_EVENT => {
                 let tx_vring = match tx_vring_opt {
                     Some(v) => v,
                     None => return Ok(()),
                 };
                 self.run_tx(rx_vring, tx_vring)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+                    .map_err(|e| io::Error::other(e.to_string()))
             }
             EXTRA_TOKEN_UDP => self
                 .handle_wg_socket_readable(rx_vring)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string())),
+                .map_err(|e| io::Error::other(e.to_string())),
             EXTRA_TOKEN_TIMER => {
                 self.handle_timer_tick()
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| io::Error::other(e.to_string()))?;
                 // Timer ticks may have unblocked WG TX (handshake completion);
                 // pump the RX queue in case anything backed up.
                 self.flush_rx(rx_vring)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+                    .map_err(|e| io::Error::other(e.to_string()))
             }
             EXTRA_TOKEN_EXIT => {
                 // Returning Err propagates up through the framework's
                 // VringEpollHandler::run loop and breaks `daemon.serve()`.
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
+                Err(io::Error::other(
                     "shutdown requested via EXTRA_TOKEN_EXIT",
                 ))
             }

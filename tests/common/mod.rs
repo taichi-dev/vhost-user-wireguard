@@ -358,7 +358,7 @@ unsafe impl Sync for SharedMem {}
 
 impl SharedMem {
     fn new(len: usize) -> std::io::Result<Self> {
-        assert!(len.is_multiple_of(PAGE_SIZE), "len must be page-aligned");
+        assert!(len % PAGE_SIZE == 0, "len must be page-aligned");
         let file = tempfile::tempfile()?;
         file.set_len(u64::try_from(len).expect("len fits u64"))?;
         let ptr = unsafe {
@@ -1044,7 +1044,7 @@ fn wait_for_used_advance(
     while Instant::now() < deadline {
         let observed = ring.read_used_idx(mem);
         if observed == target
-            || observed.wrapping_sub(target) <= u16::from(QUEUE_SIZE)
+            || observed.wrapping_sub(target) <= QUEUE_SIZE
                 && observed != ring.last_used_idx
         {
             return Ok(());
