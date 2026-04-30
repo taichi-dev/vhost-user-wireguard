@@ -574,3 +574,39 @@ Pre-populate the descriptor table FIRST (256 entries, all writable, addr=RX_BUFF
 - 5 consecutive runs of the full integration suite all pass — no flakes after fixing the address-translation bug.
 - `cargo test --lib` — 161 tests still pass.
 - `cargo clippy --tests` — zero warnings on harness or smoke files.
+
+## T31 (DHCP integration tests + persistence bug fix) — 2026-04-30
+
+### Production bug uncovered: `DhcpServer::new()` discards loaded snapshot
+`src/dhcp/mod.rs::DhcpServer::new` had `let _snap: LeaseSnapshot = persist.load()?;` — the loaded leases were never transferred into the new `LeaseStore`. Every restart began with an empty in-memory lease store, so AC-DHCP-9 ("lease persistence across restart") was never actually delivered. The unit tests in `dhcp::tests::test_checkpoint_persists_leases` only validate the **save** half of the round-trip; they never restart `DhcpServer` and so never noticed. Fix: iterate `snap.leases`, restore each `Bound { expires_at }` lease via `LeaseStore::bind` with `remaining = expires_at - now` seconds. Skips leases already past expiry. `Released`/`Probation`/`Offered` states are deliberately not restored because INIT-REBOOT/RENEW/REBIND cycles only consult `Bound` leases.
+
+### `VUWG_LEASE_PATH` env var: minimal testability hook
+Daemon previously hardcoded `/var/lib/vhost-user-wireguard/leases.json` (FHS), which is unwritable by non-root test runners. Added `std::env::var_os("VUWG_LEASE_PATH").map(PathBuf::from).unwrap_or_else(...)` to `src/lib.rs` so tests can redirect persistence to a tempdir-owned path. Three-line change; production behavior unchanged when env var is unset. Documented inline that this is a testability escape hatch, not a recommended deployment knob.
+
+### `tempfile::TempPath` isn't `Send` cleanly across closures, but `PathBuf` is
+The harness's `lease_path: PathBuf` field stores a plain `PathBuf` derived from `work_dir.path().join("leases.json")` — `work_dir: tempfile::TempDir` keeps the directory alive via `_work_dir` in the struct, so the path stays valid for the harness lifetime. No `TempPath` needed for the lease file itself because the daemon (not the harness) creates it.
+
+### dhcproto v4 reply parsing pattern: variable IHL matters
+`parse_dhcp_reply` walks Ethernet (14) → IPv4 (`ihl = (byte[0] & 0x0f) * 4`) → UDP (8) → DHCP. The daemon emits `ihl=20` (no options) but a defensive parser must read the IHL byte to compute the UDP offset. `Message::decode(&mut Decoder::new(udp_payload))` consumes the DHCP segment.
+
+### EC-D-6 ("DECLINE then DISCOVER → NAK") is silently-dropped, NOT NAK
+Plan said "DISCOVER on probationed pool → NAK", but `dhcp::DhcpServer::handle_discover` calls `store.allocate(...)?` which propagates `DhcpError::PoolExhausted` upward. The classifier (`src/datapath/intercept.rs:152-158`) maps any `Err` from `dhcp.handle_packet` to `Drop(BadUdpHeader)` — no NAK is generated. The daemon doesn't currently NAK on pool exhaustion; it drops. Test asserts `read_rx_frame().is_none()` instead of "receives NAK" — matches actual behavior.
+
+### `chaddr_mismatch` drop happens INSIDE the DHCP server, not at Ethernet anti-spoof
+The intercept classifier rejects frames whose Ethernet src MAC differs from `cfg.vm_mac` (`SrcMacSpoofed` drop). To exercise the *DHCP-server-side* chaddr filter (line 113 of `dhcp/mod.rs`), the test sets Ethernet src MAC to VM_MAC but populates the DHCP `chaddr` field with a different MAC. This passes the Ethernet anti-spoof and reaches the DHCP module, which then drops via `if chaddr != self.vm.mac.bytes() { return Ok(None); }`.
+
+### EC-D-7 ("RELEASE then re-acquire same IP") works because of single-IP pool
+Plan note "since reservations win" is misleading — the default test config has empty reservations. Re-acquisition returns the same IP because (a) the pool is exactly `[10.42.0.2]` (one entry), and (b) `LeaseStore::allocate` skips other-MAC leases via `if *m == mac { continue }` so the released IP becomes the only candidate. Even with a multi-IP pool, the same MAC would *probably* get the same IP since `Released` state isn't filtered out by the allocator's "don't reuse Offered/Bound" check, but that's an implementation detail.
+
+### Pre-seeded lease JSON must use `Bound` (not `Offered`) state
+`LeaseState` is externally tagged in serde: `{"Bound":{"expires_at":<unix_secs>}}`. INIT-REBOOT lookup (line 191 of `dhcp/mod.rs`) requires `!matches!(lease.state, LeaseState::Released)`, so seeded leases must be `Bound`. Also: `expires_at` is a `SystemTime` serialized as `u64` unix seconds via the custom `serde_system_time` module (see T16 wisdom).
+
+### `LeaseStore::bind` is the natural restoration entry point
+Rather than adding a new public API to `LeaseStore`, the persistence-restore loop in `DhcpServer::new` reuses `bind(mac, ip, secs, now)` — which sets `state = Bound { expires_at: now + secs }`. The IP is restored exactly; the `expires_at` is approximate (preserves remaining duration, loses absolute wall-clock). Acceptable because boringtun WG sessions outlive DHCP leases anyway, and clients renew at T1 (half lease).
+
+### Verification (T31)
+- `cargo build --release --locked` — clean.
+- `cargo test --test integration_dhcp` — 7/7 pass in ~2.0s.
+- `cargo test --lib` — 161/161 still pass (no regressions from `DhcpServer::new` change).
+- `cargo test --test integration_smoke` — 3/3 still pass (harness backward-compatible).
+- `cargo clippy --tests` on changed files — zero new warnings (pre-existing `never_loop` in `src/lib.rs::spawn_signal_thread` predates T30).

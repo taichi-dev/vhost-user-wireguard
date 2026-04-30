@@ -148,7 +148,14 @@ pub fn run(cli: CliArgs) -> Result<(), Error> {
     // 9. Build the DHCP server. LeaseFile::load() runs inside DhcpServer::new
     //    via LeaseFile::new(...).load() — corrupt files are renamed and the
     //    server starts from an empty lease table.
-    let lease_path = PathBuf::from(DEFAULT_LEASE_PATH);
+    //
+    //    The path defaults to `/var/lib/vhost-user-wireguard/leases.json`
+    //    (FHS), but can be overridden via the `VUWG_LEASE_PATH` environment
+    //    variable. The override exists so the integration test harness can
+    //    redirect persistence to a test-owned tempdir without requiring root.
+    let lease_path = std::env::var_os("VUWG_LEASE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_LEASE_PATH));
     let dhcp = DhcpServer::new(
         config.network.clone(),
         config.dhcp.clone(),

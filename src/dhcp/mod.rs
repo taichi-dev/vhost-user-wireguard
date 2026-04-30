@@ -53,7 +53,7 @@ impl DhcpServer {
         persist_path: PathBuf,
     ) -> Result<Self, DhcpError> {
         let persist = LeaseFile::new(persist_path);
-        let _snap: LeaseSnapshot = persist.load()?;
+        let snap: LeaseSnapshot = persist.load()?;
 
         let reservations: Vec<([u8; 6], Ipv4Addr)> = dhcp_cfg
             .reservations
@@ -61,7 +61,18 @@ impl DhcpServer {
             .map(|r| (r.mac.bytes(), r.ip))
             .collect();
 
-        let store = LeaseStore::new(reservations, dhcp_cfg.pool.start, dhcp_cfg.pool.end);
+        let mut store = LeaseStore::new(reservations, dhcp_cfg.pool.start, dhcp_cfg.pool.end);
+
+        let now = SystemTime::now();
+        for lease in snap.leases {
+            if let LeaseState::Bound { expires_at } = lease.state {
+                let remaining = expires_at.duration_since(now).unwrap_or_default();
+                let secs = u32::try_from(remaining.as_secs()).unwrap_or(u32::MAX);
+                if secs > 0 {
+                    let _ = store.bind(lease.mac, lease.ip, secs, now);
+                }
+            }
+        }
 
         Ok(Self {
             network,

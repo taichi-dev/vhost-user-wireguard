@@ -172,6 +172,14 @@ pub fn write_temp_config(
 }
 
 pub fn default_config(socket_path: &Path, listen_port: u16) -> tempfile::TempPath {
+    config_from_template(socket_path, listen_port, CONFIG_TEMPLATE)
+}
+
+pub fn config_from_template(
+    socket_path: &Path,
+    listen_port: u16,
+    template: &str,
+) -> tempfile::TempPath {
     let priv_key = fake_wg_key(0x11);
     let peer_pub = fake_wg_key(0x22);
     let port_str = listen_port.to_string();
@@ -181,7 +189,7 @@ pub fn default_config(socket_path: &Path, listen_port: u16) -> tempfile::TempPat
     fields.insert("wg_port", &port_str);
     fields.insert("wg_peer_pub", &peer_pub);
     fields.insert("vu_socket", &socket_str);
-    write_temp_config(CONFIG_TEMPLATE, fields)
+    write_temp_config(template, fields)
 }
 
 fn wait_for_path(path: &Path, deadline: Instant) -> bool {
@@ -568,6 +576,7 @@ pub struct MockVhostUserMaster {
     socket_path: PathBuf,
     config_path: tempfile::TempPath,
     stderr_path: PathBuf,
+    lease_path: PathBuf,
     _work_dir: tempfile::TempDir,
     mem: SharedMem,
     rx: RingPair,
@@ -586,13 +595,37 @@ impl MockVhostUserMaster {
     /// negotiation, and pre-publish RX descriptors so the daemon has buffer
     /// space waiting.
     pub fn spawn() -> Self {
+        Self::spawn_with_options(CONFIG_TEMPLATE, None)
+    }
+
+    /// Spawn variant that uses a custom TOML template. The template still
+    /// gets the standard `{wg_priv}`, `{wg_port}`, `{wg_peer_pub}`, and
+    /// `{vu_socket}` substitutions applied.
+    pub fn spawn_with_config_template(template: &str) -> Self {
+        Self::spawn_with_options(template, None)
+    }
+
+    /// Spawn variant that pre-seeds the daemon's lease file with the given
+    /// JSON. The file is written to the daemon's `VUWG_LEASE_PATH` BEFORE
+    /// the daemon starts, so it is loaded into the in-memory lease store
+    /// during DhcpServer construction.
+    pub fn spawn_with_seeded_lease(seed_lease_json: &str) -> Self {
+        Self::spawn_with_options(CONFIG_TEMPLATE, Some(seed_lease_json))
+    }
+
+    fn spawn_with_options(template: &str, seed_lease_json: Option<&str>) -> Self {
         let work_dir = tempfile::Builder::new()
             .prefix("vuwg-test-")
             .tempdir()
             .expect("tempdir for test workspace");
         let socket_path = work_dir.path().join("vhost.sock");
         let listen_port = alloc_listen_port();
-        let config_path = default_config(&socket_path, listen_port);
+        let config_path = config_from_template(&socket_path, listen_port, template);
+        let lease_path = work_dir.path().join("leases.json");
+
+        if let Some(json) = seed_lease_json {
+            std::fs::write(&lease_path, json).expect("seed lease file");
+        }
 
         let bin = resolve_daemon_binary();
         let mut command = Command::new(&bin);
@@ -610,6 +643,7 @@ impl MockVhostUserMaster {
             "RUST_LOG",
             std::env::var("VUWG_TEST_LOG").unwrap_or_else(|_| "off".to_string()),
         );
+        command.env("VUWG_LEASE_PATH", &lease_path);
 
         let child = command.spawn().unwrap_or_else(|e| {
             panic!(
@@ -638,6 +672,7 @@ impl MockVhostUserMaster {
             socket_path,
             config_path,
             stderr_path,
+            lease_path,
             _work_dir: work_dir,
             mem,
             rx,
@@ -648,6 +683,10 @@ impl MockVhostUserMaster {
         };
         harness.connect_and_negotiate();
         harness
+    }
+
+    pub fn lease_path(&self) -> &Path {
+        &self.lease_path
     }
 
     fn dump_daemon_stderr(&self) -> String {
@@ -705,6 +744,7 @@ impl MockVhostUserMaster {
             "RUST_LOG",
             std::env::var("VUWG_TEST_LOG").unwrap_or_else(|_| "off".to_string()),
         );
+        command.env("VUWG_LEASE_PATH", &self.lease_path);
         let child = command.spawn().expect("respawn daemon");
         self.daemon = DaemonChild { child: Some(child) };
 
