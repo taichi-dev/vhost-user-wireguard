@@ -2,3 +2,4 @@
 
 pub mod intercept;
 pub mod vnet;
+pub mod vring;

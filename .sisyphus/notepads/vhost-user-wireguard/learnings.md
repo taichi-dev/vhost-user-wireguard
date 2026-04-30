@@ -343,3 +343,61 @@
 - DropReason variants `FrameTooBig` and `ShortDescriptorChain` are declared but not constructed by `classify` itself — they're for caller-side use (vring code, oversized-buffer detection upstream). `pub enum` variants don't trigger `dead_code` warnings since they're part of the public API.
 - 12 tests pass: frame_too_small, frame_too_big_generates_icmp, src_mac_spoofed, eth_type_ipv6_filtered, eth_type_vlan_filtered, arp_reply_path, dhcp_reply_path, src_ip_spoofed, no_route, valid_tunnel_path, fragmented_drop, bad_ipv4_header.
 - `cargo check` clean; `cargo test --lib datapath::intercept` 12/12 passes in 0.00s.
+
+## T27: src/datapath/vring.rs (TX/RX vring processors) — 2026-04-30
+
+### vhost-user-backend 0.22 / virtio-queue 0.17 API surface
+- `VringRwLock` (default `M = GuestMemoryAtomic<GuestMemoryMmap>`) implements `VringT` trait — convenience methods (`add_used`, `signal_used_queue`, `enable_notification`, `disable_notification`) take `&self` and use the *internal* mem.
+- `VringT` trait has NO `iter` method. To iterate descriptor chains, must:
+  1. `vring.get_mut()` → `RwLockWriteGuard<VringState<M>>`
+  2. `state.get_queue_mut()` → `&mut Queue` (from `virtio_queue::Queue`)
+  3. `queue.iter(mem)` (where `mem: impl Deref<Target: GuestMemory>`) → `Result<AvailIter<'_, M>, Error>`
+  4. `.next()` → `Option<DescriptorChain<M>>`
+- `VringT` trait MUST be in scope (`use vhost_user_backend::VringT`) to call `get_mut()` etc.
+- `GuestAddressSpace` trait MUST be in scope (`use vm_memory::GuestAddressSpace`) to call `.memory()` on `GuestMemoryAtomic`.
+- `Queue::iter`, `add_used`, `enable_notification`, `disable_notification` ALL take `mem` as argument (despite plan hints suggesting otherwise) — the plan's "vring.iter(mem)" was approximate.
+
+### EVENT_IDX-correct drain loop pattern
+- The mandatory pattern is the OUTER `disable → drain → enable` loop, NOT a single drain pass.
+- Without the outer loop, kicks delivered between the last drain and `enable_notification` are lost. `enable_notification` returning `false` is the signal that no work was added meanwhile and we can safely break.
+- Single signal_used_queue at the END of the outer loop (covers all batches in this kick).
+
+### DescriptorChain lifetime trick: clone before consuming readable()
+- `DescriptorChain<M>` derives `Clone`. Cloning is shallow (copies `mem: M` + indices + ttl).
+- `chain.memory()` returns `&M::Target` borrowing chain; `chain.readable()` consumes chain.
+- To get both a memory ref AND iterate the readable side: `let mem_keeper = chain.clone(); let mem = mem_keeper.memory(); for desc in chain.readable() { ... }`.
+- Same trick for `chain.writable()`.
+
+### read_descriptor_chain implementation pattern
+- Two-pass walk: first collect `(GuestAddress, u32 len)` pairs, then size buffer exactly via `checked_add`, then issue one `read_slice` per descriptor.
+- `usize::try_from(u32 len)` is mandatory (`as` is forbidden by project rules even when widening).
+- Returns owned `Vec<u8>` so the TX hot path can take ownership for classification + dispatch.
+
+### Counters HashMap with `DropReason::EthTypeFiltered(u16)` — collapse approach
+- HashMap<DropReason, AtomicU64> can't dynamically insert AtomicU64 (HashMap is not interior-mut, AtomicU64 is). Pre-populate at construction.
+- `EthTypeFiltered(u16)` has a payload ⇒ infinite key space ⇒ collapse to `EthTypeFiltered(0)` bucket. Document as "single bucket counts all filtered ethertypes".
+- `inc_drop(reason)`: match for collapse, then `drops.get(&key).map(|c| c.fetch_add(1, Relaxed))`.
+
+### Generic TxProcessor<'a, M: GuestMemory> with non-generic VringRwLock
+- Can't make M parameterize both the processor's mem AND the VringRwLock's internal mem (lifetime + 'static + GuestAddressSpace bound mismatch).
+- Pragmatic resolution: `vring: &'a VringRwLock` (default `GuestMemoryAtomic<GuestMemoryMmap>`) + `mem: &'a M` (generic). Caller's responsibility to ensure they refer to the same memory.
+- The `&'a mut RxProcessor<'a, M>` self-referential lifetime works because TxProcessor and the inner RxProcessor are constructed in the same scope.
+
+### Test setup: manual avail-ring + descriptor table population
+- `MockSplitQueue` from `virtio_queue::mock` is gated behind `#[cfg(any(test, feature = "test-utils"))]` — NOT available to dependent crates' tests unless the `test-utils` feature is enabled in Cargo.toml.
+- For T27 tests, populate raw guest memory directly:
+  - Descriptor at index `i`: 16 bytes at `desc_table_addr + i*16` (addr u64 LE | len u32 LE | flags u16 LE | next u16 LE).
+  - Avail ring entry: head index u16 LE at `avail_ring_addr + 4 + slot*2`; publish via `avail.idx` u16 LE at `avail_ring_addr + 2`.
+  - Used ring entry: device-written, no test setup needed.
+- VringRwLock test setup: `GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)])` → `GuestMemoryAtomic::new(...)` → `VringRwLock::new(atomic.clone(), QUEUE_SIZE)` → `set_queue_size`, `set_queue_info`, `set_queue_event_idx(true)`, `set_queue_ready(true)`, `set_enabled(true)`.
+- Get a `&GuestMemoryMmap` ref from the atomic: `let guard = atomic.memory(); let mem: &GuestMemoryMmap = &guard;` — guard derefs to `&GuestMemoryMmap` and stays alive while guard is in scope.
+
+### Verification / test results
+- 6 tests pass: counters_increment_drop, rx_overflow_drops_oldest, rx_enqueue_and_flush_writes_to_vring, tx_drains_batch_under_event_idx, tx_drop_increments_counter_for_short_frame, read_descriptor_chain_concatenates_segments.
+- Production code is unwrap-free (verified via awk filter excluding `#[cfg(test)]` block).
+- Clippy clean: no new warnings introduced in vring.rs (4 pre-existing warnings in other files unaffected).
+
+### handle_one dispatch — Tunnel dst_ip extraction
+- `InterceptDecision::Tunnel { peer_idx, ip_packet }` — peer_idx is the route lookup result and currently not used by the dispatch; the spec requires extracting dst_ip from `ip_packet[16..20]` and re-routing through `WgEngine::handle_tx_ip_packet(dst_ip, &ip_packet)`.
+- Length sanity check before slicing: `ip_packet.len() >= 20` (offset 16 + addr len 4) → otherwise `BadIpv4Header` drop. classify already filters short packets but defensive check is cheap.
+- WG dispatch failure (e.g., no route after engine state change) is logged at trace level + counted as `NoRoute` drop — does NOT propagate as VhostError.
