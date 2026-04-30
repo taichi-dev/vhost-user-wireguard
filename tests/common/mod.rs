@@ -595,14 +595,14 @@ impl MockVhostUserMaster {
     /// negotiation, and pre-publish RX descriptors so the daemon has buffer
     /// space waiting.
     pub fn spawn() -> Self {
-        Self::spawn_with_options(CONFIG_TEMPLATE, None)
+        Self::spawn_with_options(CONFIG_TEMPLATE, None, None)
     }
 
     /// Spawn variant that uses a custom TOML template. The template still
     /// gets the standard `{wg_priv}`, `{wg_port}`, `{wg_peer_pub}`, and
     /// `{vu_socket}` substitutions applied.
     pub fn spawn_with_config_template(template: &str) -> Self {
-        Self::spawn_with_options(template, None)
+        Self::spawn_with_options(template, None, None)
     }
 
     /// Spawn variant that pre-seeds the daemon's lease file with the given
@@ -610,10 +610,22 @@ impl MockVhostUserMaster {
     /// the daemon starts, so it is loaded into the in-memory lease store
     /// during DhcpServer construction.
     pub fn spawn_with_seeded_lease(seed_lease_json: &str) -> Self {
-        Self::spawn_with_options(CONFIG_TEMPLATE, Some(seed_lease_json))
+        Self::spawn_with_options(CONFIG_TEMPLATE, Some(seed_lease_json), None)
     }
 
-    fn spawn_with_options(template: &str, seed_lease_json: Option<&str>) -> Self {
+    /// Spawn variant that explicitly sets the daemon's `RUST_LOG` filter,
+    /// overriding both the default `off` and any `VUWG_TEST_LOG` env var.
+    /// Used by tests that need to capture daemon log output (for example,
+    /// the secret-leakage detector in `integration_sec.rs`).
+    pub fn spawn_with_log_filter(template: &str, log_filter: &str) -> Self {
+        Self::spawn_with_options(template, None, Some(log_filter))
+    }
+
+    fn spawn_with_options(
+        template: &str,
+        seed_lease_json: Option<&str>,
+        log_filter_override: Option<&str>,
+    ) -> Self {
         let work_dir = tempfile::Builder::new()
             .prefix("vuwg-test-")
             .tempdir()
@@ -638,11 +650,16 @@ impl MockVhostUserMaster {
             .arg(cfg_arg)
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file));
+        let log_filter = log_filter_override
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                std::env::var("VUWG_TEST_LOG").unwrap_or_else(|_| "off".to_string())
+            });
+        if log_filter != "off" {
+            command.arg("--log-filter").arg(&log_filter);
+        }
         command.env_remove("NOTIFY_SOCKET");
-        command.env(
-            "RUST_LOG",
-            std::env::var("VUWG_TEST_LOG").unwrap_or_else(|_| "off".to_string()),
-        );
+        command.env("RUST_LOG", &log_filter);
         command.env("VUWG_LEASE_PATH", &lease_path);
 
         let child = command.spawn().unwrap_or_else(|e| {
@@ -689,8 +706,16 @@ impl MockVhostUserMaster {
         &self.lease_path
     }
 
-    fn dump_daemon_stderr(&self) -> String {
+    pub fn stderr_path(&self) -> &Path {
+        &self.stderr_path
+    }
+
+    pub fn read_daemon_stderr(&self) -> String {
         std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
+    }
+
+    fn dump_daemon_stderr(&self) -> String {
+        self.read_daemon_stderr()
     }
 
     /// Drop the existing connection, terminate the daemon child, spawn a

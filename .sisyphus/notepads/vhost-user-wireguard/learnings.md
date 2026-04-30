@@ -685,3 +685,48 @@ The daemon binds `[::]:port` with `IPV6_V6ONLY=0`. When a fake peer at `127.0.0.
 - `cargo test --tests` (full integration suite: smoke + arp + dhcp + wg) — 21/21 pass + 1 ignored (the pre-existing gratuitous-ARP placeholder from T32).
 - `cargo clippy --test integration_wg -- -A clippy::never_loop` — 0 warnings on `tests/integration_wg.rs`. Pre-existing warnings in `tests/common/mod.rs` (MSRV nit, useless conversion) and `src/*` (manual range, map_or, io::Error::other, never_loop) are unchanged.
 - Production change: `src/datapath/mod.rs::run_serve_loop` now calls `start + register_external_fds + wait` instead of `serve`. This wires up the WG UDP socket, the 1 Hz timerfd, and the exit fd with the framework's `VringEpollHandler`, fixing the dead-code bug noted in T30 wisdom. Backward-compatible: the function signature is unchanged (the `_backend` parameter is now `backend` and is actually used to read the three fds before start).
+
+## T34: integration_sec.rs — hostile-guest + privilege + log-secrecy tests (2026-04-30)
+
+### Daemon log filter is CLI-driven, NOT env-driven (gotcha)
+- `src/ops/logging.rs` calls `EnvFilter::try_new(filter)` where `filter` comes from `cli.log_filter.as_deref().unwrap_or("info")` (lib.rs).
+- `EnvFilter::try_new` does NOT read RUST_LOG. Setting RUST_LOG=trace on the daemon process is a no-op.
+- Pre-T34 the harness in `tests/common/mod.rs` set `command.env("RUST_LOG", ...)` but did not pass `--log-filter`. Existing tests pass because at default `info` level the daemon emits ~zero log lines on the happy path.
+- T34 added `MockVhostUserMaster::spawn_with_log_filter(template, filter)` which passes `--log-filter` as a CLI arg in addition to the (no-op) RUST_LOG env. `read_daemon_stderr()` and `stderr_path()` are now public so tests can grep the daemon's stderr file.
+
+### Trust-boundary integration tests pattern
+- Drop-tests assert `master.read_rx_frame().is_none()` — the daemon's classifier drops are silent (counters bump in-process, no log emission).
+- Use `IPPROTO_TCP` (proto=6) for src-IP-spoof tests so the DHCP fast-path (step 8) does NOT short-circuit before step 9 (anti-spoof).
+- Source-MAC anti-spoof fires at step 3, BEFORE ARP/IPv4 parsing. Build a frame with `src_mac != VM_MAC` and any payload — even broken IPv4 — and the classifier rejects it.
+- Ethertype filter (0x86DD IPv6, 0x8100 VLAN) fires at step 4, after src-MAC check but before any L3 parsing. The frame's payload bytes are irrelevant.
+
+### Jumbo-frame ICMP T3C4 cannot use the spec's 9000 bytes
+- Harness `BUFFER_SIZE = 4096` per descriptor (with 12-byte vnet_hdr, max payload 4084 bytes). Pushing >4084 panics with "frame N bytes exceeds harness buffer 4084".
+- The intercept triggers ICMP T3C4 on ANY frame whose total length > `vm.mtu + 14 = 1434`. So 1500 bytes is sufficient and matches a real-world failure (guest tries default Ethernet MTU after DHCP advertised 1420).
+- ICMP reply layout:
+  - bytes 0-13: Ethernet header (dst=VM_MAC, src=GATEWAY_MAC, ethertype=0x0800)
+  - bytes 14: IPv4 version/IHL (0x45 → ihl=5 words=20 bytes)
+  - bytes 14+9: IP protocol (must be 1 = ICMP)
+  - bytes 14+ihl: ICMP type (must be 3) and code (must be 4)
+  - bytes 14+ihl+6..14+ihl+8: 16-bit big-endian next-hop MTU (must be `vm.mtu`)
+
+### Secret-leakage detector
+- `BASE64.encode([seed; 32])` produces the same 44-char string the daemon parses from the config — grepping for it in stderr is the most direct leak detector.
+- Hex form (`format!("{b:02x}")` × 32) is also worth grepping — boringtun's debug paths could in theory print key bytes hex-formatted.
+- Empty-stderr is acceptable: trivially "no secrets logged". Do NOT assert stderr is non-empty — at trace level the daemon's happy-path output is naturally sparse.
+
+### Privilege tests are #[ignore]'d under non-root
+- The daemon already calls `crate::ops::caps::drop_capabilities()` from `lib.rs::run` step 13 unconditionally — there's no `drop_user` config knob yet, so the privilege tests verify only what currently exists: post-drop `CapEff = 0000000000000000`, `CapBnd = 0000000000000000`, `NoNewPrivs = 1` in `/proc/$pid/status`.
+- The privilege tests need a way to identify the daemon's PID without exposing `child.id()` from the harness. Walking `/proc/*/exe` for symlinks pointing at the daemon binary works; `std::fs::canonicalize(common::DAEMON_BIN)` resolves the canonical path that `/proc/$pid/exe` returns.
+- Both privilege tests are `#[ignore = "..."]` with a clear reason string, matching the pattern of `test_gratuitous_arp_after_dhcp_ack` from T32.
+
+### MockVhostUserMaster API additions
+- `pub fn spawn_with_log_filter(template: &str, log_filter: &str) -> Self` — like `spawn_with_config_template` but also passes `--log-filter <log_filter>` CLI arg.
+- `pub fn stderr_path(&self) -> &Path` — exposes the daemon's stderr log file path (was previously private).
+- `pub fn read_daemon_stderr(&self) -> String` — public alias for the previously-private `dump_daemon_stderr`. Useful for log-grep-based assertions.
+- `spawn_with_options` signature now takes a third `log_filter_override: Option<&str>` arg — internal change, no callers outside common/mod.rs.
+
+### Test results
+- `cargo test --test integration_sec`: 6 passed + 2 ignored (privilege tests) — exactly as required.
+- `cargo test --lib`: 161 passed (no regression from T34's harness change).
+- Full `cargo test --tests`: lib 161 + arp 3+1ignored + dhcp 7 + sec 6+2ignored + smoke 3 + wg 8 = 188 passing tests, 3 ignored.
