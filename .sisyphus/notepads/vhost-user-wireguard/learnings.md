@@ -328,3 +328,18 @@
 
 ### WgError::PeerNotFound semantics
 - The `index: usize` field is currently used loosely — for "no route found" we pass `0` as a sentinel. Future revision could add a `NoRoute { dst_ip }` variant for clarity (out of T25 scope: error.rs untouched).
+
+## T26: TX-side trust-boundary classifier (src/datapath/intercept.rs) (2026-04-30)
+
+- The `classify` pipeline is pure: takes `&[u8] frame, &InterceptCfg, lease, &AllowedIpsRouter, SystemTime, &mut DhcpServer, gateway_ip` and returns a single enum decision; performs ZERO I/O.
+- `cfg.gateway_ip` and the separate `gateway_ip` argument serve different roles: `cfg.gateway_ip` matches against the ARP target, `gateway_ip` is used as the source IP of the synthesized ICMP frag-needed.
+- For the FrameTooBig branch the response is `IcmpFragNeeded`, NOT a `Drop` — the spec is explicit that the ICMP packet IS the response to the VM, not an error condition.
+- IcmpFragNeeded wrap order: `build_icmp_frag_needed(frame[14..], vm_mtu, gateway_ip)` returns a complete IPv4 packet → wrap in `build_eth_frame(cfg.vm_mac, cfg.gateway_mac, 0x0800, &icmp_ipv4)` — note `cfg.vm_mac` is the *destination* (the VM receives the ICMP error), `cfg.gateway_mac` is the *source*.
+- IPv4 fragmentation is detected by reading bytes 6-7 of the IP header directly (the `Ipv4Packet` parser does NOT expose a `flags()` getter). Pattern: `let ff = u16::from_be_bytes([raw[6], raw[7]]); let mf = (ff & 0x2000) != 0; let frag = ff & 0x1FFF;`.
+- DHCP fast-path entry condition is *all three*: `proto == 17 (UDP)` AND `UdpPacket::new` succeeds AND `dst_port == 67`. If any condition fails, fall through to the source-IP / route-lookup pipeline (e.g., a UDP packet to dst_port 53 should still tunnel).
+- Source-IP anti-spoof predicate: `src_ip != UNSPECIFIED && lease.map_or(true, |l| src_ip != l)`. The `map_or(true, ...)` means "no lease ⇒ reject any non-zero src_ip". `0.0.0.0` is allowed unconditionally (used by some boot protocols before DHCP completes).
+- For tests, building a DHCP DISCOVER inline (rather than reusing `dhcp::tests`'s private helper) is the cleanest approach; only need `MessageType::Discover`, broadcast flag, and chaddr=VM_MAC to elicit an OFFER.
+- For the `test_valid_tunnel_path`, `"0.0.0.0/0".parse::<ip_network::IpNetwork>()` is the simplest catch-all route.
+- DropReason variants `FrameTooBig` and `ShortDescriptorChain` are declared but not constructed by `classify` itself — they're for caller-side use (vring code, oversized-buffer detection upstream). `pub enum` variants don't trigger `dead_code` warnings since they're part of the public API.
+- 12 tests pass: frame_too_small, frame_too_big_generates_icmp, src_mac_spoofed, eth_type_ipv6_filtered, eth_type_vlan_filtered, arp_reply_path, dhcp_reply_path, src_ip_spoofed, no_route, valid_tunnel_path, fragmented_drop, bad_ipv4_header.
+- `cargo check` clean; `cargo test --lib datapath::intercept` 12/12 passes in 0.00s.
