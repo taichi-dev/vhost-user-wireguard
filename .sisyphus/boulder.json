@@ -29,6 +29,112 @@
       "agent": "Sisyphus-Junior",
       "category": "deep",
       "updated_at": "2026-04-30T03:56:19.216Z"
+    },
+    "todo:27": {
+      "task_key": "todo:27",
+      "task_label": "27",
+      "task_title": "**src/datapath/vring.rs — TX/RX vring processors with EVENT_IDX support**",
+      "session_id": "ses_22373dea9ffe0VSG5xA2GIWJs1",
+      "agent": "Sisyphus-Junior",
+      "category": "deep",
+      "updated_at": "2026-04-30T04:19:04.219Z"
+    },
+    "todo:28": {
+      "task_key": "todo:28",
+      "task_label": "28",
+      "task_title": "**src/datapath/mod.rs — VhostUserBackendMut impl + reconnect-aware fd registration**",
+      "session_id": "ses_2236224c8ffelpcYJqJz3ifS0R",
+      "agent": "Sisyphus-Junior",
+      "category": "deep",
+      "updated_at": "2026-04-30T04:32:21.699Z"
+    },
+    "todo:29": {
+      "task_key": "todo:29",
+      "task_label": "29",
+      "task_title": "**src/lib.rs run() + src/main.rs — full daemon wiring + signal handling**",
+      "session_id": "ses_223560c60ffeAXv13P8qx0uq3j",
+      "agent": "Sisyphus-Junior",
+      "category": "deep",
+      "updated_at": "2026-04-30T04:42:55.325Z"
+    },
+    "todo:30": {
+      "task_key": "todo:30",
+      "task_label": "30",
+      "task_title": "**tests/common/ — mock vhost-user master test harness**",
+      "session_id": "ses_2234b8a16ffePCdyrQ5d3G4uEF",
+      "agent": "Sisyphus-Junior",
+      "updated_at": "2026-04-30T05:19:43.716Z"
+    },
+    "todo:31": {
+      "task_key": "todo:31",
+      "task_label": "31",
+      "task_title": "**tests/integration_dhcp.rs — full DHCP cycle integration tests**",
+      "session_id": "ses_2232b02b3ffe9sOPXPVuc242DH",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-high",
+      "updated_at": "2026-04-30T05:35:57.395Z"
+    },
+    "todo:32": {
+      "task_key": "todo:32",
+      "task_label": "32",
+      "task_title": "**tests/integration_arp.rs — ARP responder integration tests**",
+      "session_id": "ses_2231c6805ffeVx72ZX9bi0ewq6",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-high",
+      "updated_at": "2026-04-30T05:45:32.768Z"
+    },
+    "todo:33": {
+      "task_key": "todo:33",
+      "task_label": "33",
+      "task_title": "**tests/integration_wg.rs — WireGuard handshake + datapath integration**",
+      "session_id": "ses_223136ffbffeURg2vzDOCgW2kO",
+      "agent": "Sisyphus-Junior",
+      "category": "deep",
+      "updated_at": "2026-04-30T06:16:25.299Z"
+    },
+    "todo:34": {
+      "task_key": "todo:34",
+      "task_label": "34",
+      "task_title": "**tests/integration_sec.rs — hostile-guest + privilege integration**",
+      "session_id": "ses_222f71d79ffeF90Jf1lPi6LbkK",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-high",
+      "updated_at": "2026-04-30T06:32:07.573Z"
+    },
+    "todo:35": {
+      "task_key": "todo:35",
+      "task_label": "35",
+      "task_title": "**tests/integration_smoke.rs — VAL-1 reconnect + bootstrap ordering smoke**",
+      "session_id": "ses_222e8dcb8ffea0chedVzi85hMb",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-high",
+      "updated_at": "2026-04-30T06:55:57.622Z"
+    },
+    "todo:36": {
+      "task_key": "todo:36",
+      "task_label": "36",
+      "task_title": "**packaging/ — systemd template unit + commented example TOML**",
+      "session_id": "ses_222d30249ffeVldjIA0yZhHfNd",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-04-30T06:59:30.078Z"
+    },
+    "todo:37": {
+      "task_key": "todo:37",
+      "task_label": "37",
+      "task_title": "**README + CONTRIBUTING + man-style docs**",
+      "session_id": "ses_222cfc5c7ffe1oGX3FVen4sCvL",
+      "agent": "Sisyphus-Junior",
+      "category": "writing",
+      "updated_at": "2026-04-30T07:05:25.428Z"
+    },
+    "final-wave:f1": {
+      "task_key": "final-wave:f1",
+      "task_label": "F1",
+      "task_title": "**Plan Compliance Audit** — `oracle`",
+      "session_id": "ses_222b9e5e4ffeOechE3Y7MbCGei",
+      "agent": "oracle",
+      "updated_at": "2026-04-30T07:24:38.491Z"
     }
   }
 }

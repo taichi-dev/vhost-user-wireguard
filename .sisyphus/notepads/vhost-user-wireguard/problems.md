@@ -4,6 +4,11 @@
 
 (none yet)
 
+## [2026-04-30] F3 - Real Manual QA Against Cloud Hypervisor
+**BLOCKER**: F3 requires booting a real Linux guest under Cloud Hypervisor with `--net vhost_user=true,...`. No Cloud Hypervisor hardware is available in this environment.
+**Mitigation**: Integration test suite T30-T35 (31 tests) covers the same protocol paths via mock vhost-user master harness. All acceptance criteria (AC-VU-2, AC-VU-3, AC-VU-4, AC-DHCP-7/8/9, AC-WG-1..5, AC-SEC-1..5, AC-SD-1/2/4) are verified by automated tests.
+**To complete F3**: Run on a host with Cloud Hypervisor installed: `systemctl start vhost-user-wg@vm1` then boot a guest and verify DHCP → ARP → WG handshake → ICMP through tunnel.
+
 ## Project: vhost-user-wireguard
 
 ### Gratuitous ARP after DHCP ACK is not implemented (discovered during T32)

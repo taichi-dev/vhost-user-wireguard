@@ -785,3 +785,41 @@ This is a production gap to investigate separately; out of T35 scope.
 - `pub fn read_rx_frame_with_header(&mut self) -> Option<(Vec<u8>, Vec<u8>)>` — returns the raw 12-byte vnet_hdr alongside the stripped Ethernet frame for AC-VU-3 inspection.
 - `pub fn close_frontend_and_wait_for_clean_exit(&mut self, timeout: Duration) -> Result<ExitStatus, ()>` — closes the vhost-user connection, takes ownership of the child away from `DaemonChild` so the master's drop is a no-op, and `try_wait`-polls for graceful exit. Used to avoid the SIGKILL-races-STOPPING=1 bug in `test_sd_notify_protocol`.
 - `spawn_with_options` signature now takes a fourth `notify_socket: Option<&Path>` arg — internal change, all four callers updated.
+
+## F1 Final Wave Plan Compliance Audit (2026-04-30) - APPROVED
+
+Re-audit verdict: **APPROVE**. All 15 previously-flagged violations confirmed fixed.
+
+### Verification matrix
+| Check                                                                     | Result        |
+| ------------------------------------------------------------------------- | ------------- |
+| SPDX headers on all 30 src/**/*.rs                                        | 30/30 clean   |
+| Production unwrap()/expect() lacking SAFETY comment                       | 0 violations  |
+| Production `as` numeric casts lacking SAFETY comment                      | 0 violations  |
+| println!/print! without #[allow(clippy::print_stdout)]                    | 0 violations  |
+| async fn / use tokio / use futures                                        | 0 occurrences |
+| Mutex<Tunn> / Arc<Tunn> / RefCell<Tunn>                                   | 0 occurrences |
+| Box<dyn Error> / use anyhow / anyhow::                                    | 0 occurrences |
+| tracing::instrument                                                       | 0 occurrences |
+| `cargo build --release --locked`                                          | exit 0        |
+| `cargo test --lib`                                                        | 161 passed    |
+
+### Production-code safe-cast inventory verified clean
+- src/wg/keys.rs:42, 53, 70 — SAFETY comments present
+- src/wg/peer.rs:105 — SAFETY comment present
+- src/wg/mod.rs:241 — SAFETY comment present
+- src/datapath/vnet.rs:72, 83 — SAFETY comments present
+- src/wire/icmp.rs:13, 17, 23, 74, 75, 79, 97, 98 — all SAFETY-commented
+- src/wire/ipv4.rs:16, 25 — SAFETY comments present
+- src/wire/arp.rs:21, 30 — SAFETY comments present
+- src/wire/eth.rs:17, 22 — SAFETY comments present
+- src/dhcp/options.rs:93 — SAFETY comment present
+- src/lib.rs:103 — `#[allow(clippy::print_stdout)]` with rationale present
+
+### Deliverables present
+- target/release/vhost-user-wireguard (2.86 MB, stripped ELF)
+- examples/example-vm.toml, examples/example-vm-inline-keys.toml
+- packaging/systemd/vhost-user-wg@.service
+- .github/workflows/ci.yml
+- README.md, CONTRIBUTING.md, LICENSE-MIT, LICENSE-APACHE, deny.toml
+- tests/integration_{arp,dhcp,sec,smoke,wg}.rs

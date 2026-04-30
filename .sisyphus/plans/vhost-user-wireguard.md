@@ -684,7 +684,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `feat(wg): add WG key loader with strict file-mode check`. Pre-commit: `cargo test --lib wg::keys`.
 
-- [ ] 15. **src/dhcp/options.rs — DHCP option builder for ACK/OFFER/NAK**
+- [x] 15. **src/dhcp/options.rs — DHCP option builder for ACK/OFFER/NAK**
 
   **What to do**:
   - `pub struct DhcpOptionsBuilder { ... }` wrapping `dhcproto::v4::DhcpOptions`.
@@ -734,7 +734,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `feat(dhcp): add DHCP option builder with RFC 2131/2132/3442 compliance`. Pre-commit: `cargo test --lib dhcp::options`.
 
-- [ ] 16. **src/dhcp/persist.rs — atomic-write JSON lease persistence**
+- [x] 16. **src/dhcp/persist.rs — atomic-write JSON lease persistence**
 
   **What to do**:
   - `pub struct LeaseFile { path: PathBuf }`. Methods: `new(path: PathBuf) -> Self`; `load(&self) -> Result<LeaseSnapshot, DhcpError>` (returns empty + warn-log on corrupt JSON, renaming the file to `<path>.corrupt.<unix_ts>` per EC-FS-3); `save(&self, snap: &LeaseSnapshot) -> Result<(), DhcpError>` (write to `<path>.tmp`, fsync the temp, rename to `<path>`, fsync the parent directory).
@@ -787,7 +787,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `feat(dhcp): add atomic-write JSON lease persistence + parent-dir fsync`. Pre-commit: `cargo test --lib dhcp::persist`.
 
-- [ ] 17. **src/arp/mod.rs — ARP responder for the virtual gateway**
+- [x] 17. **src/arp/mod.rs — ARP responder for the virtual gateway**
 
   **What to do**:
   - `pub struct ArpResponder { gateway_ip: Ipv4Addr, gateway_mac: [u8; 6] }`. Method: `pub fn handle_request(&self, eth_in: &[u8]) -> Option<Vec<u8>>`. Parses Ethernet → ARP; verifies request is for `gateway_ip`; if yes builds reply: Ethernet (dst=requester_sha, src=gateway_mac, ethertype=ARP), ARP reply (op=Reply, sha=gateway_mac, spa=gateway_ip, tha=requester_sha, tpa=requester_spa). Returns `Some(reply_bytes)` or `None` (drop).
@@ -827,7 +827,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `feat(arp): add ARP responder for the virtual gateway`. Pre-commit: `cargo test --lib arp`.
 
-- [ ] 18. **src/wire/icmp.rs — ICMPv4 generator for fragmentation-needed (Type 3 Code 4)**
+- [x] 18. **src/wire/icmp.rs — ICMPv4 generator for fragmentation-needed (Type 3 Code 4)**
 
   **What to do**:
   - `pub fn build_dest_unreachable_frag_needed(src_mac: [u8;6], dst_mac: [u8;6], src_ip: Ipv4Addr, dst_ip: Ipv4Addr, next_hop_mtu: u16, original_packet: &[u8]) -> Vec<u8>`. Builds Ethernet + IPv4 + ICMPv4 (type=3, code=4), with the inner ICMP payload containing the offending IPv4 header + first 8 bytes of its data (per RFC 792). Sets `next_hop_mtu` in the unused field of the ICMP header (RFC 1191).
@@ -868,7 +868,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `feat(wire): add ICMPv4 Type 3 Code 4 generator (RFC 792/1191)`. Pre-commit: `cargo test --lib wire::icmp`.
 
-- [ ] 19. **src/ops/logging.rs — tracing-subscriber installation (text + JSON)**
+- [x] 19. **src/ops/logging.rs — tracing-subscriber installation (text + JSON)**
 
   **What to do**:
   - `pub fn install(level: &str, format: LogFormat) -> Result<(), Error>`. Builds `tracing_subscriber::fmt` layer in either text or JSON mode based on `format`. Filter from `EnvFilter::try_new(level)?`. Sets the dispatcher globally via `set_global_default`. JSON mode uses `with_target(true).with_thread_ids(false).with_thread_names(false).with_file(false).with_line_number(false)` — minimal noise. Text mode uses default `with_target(false)` and ANSI when stderr is a TTY.
@@ -912,7 +912,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `feat(ops): add tracing-subscriber installer (text + JSON)`. Pre-commit: `cargo test --lib ops::logging`.
 
-- [ ] 20. **src/ops/caps.rs — privilege drop (setgid/setuid + capability dropping)**
+- [x] 20. **src/ops/caps.rs — privilege drop (setgid/setuid + capability dropping)**
 
   **What to do**:
   - `pub fn drop_privileges(drop_user: Option<&str>, drop_group: Option<&str>, caps_keep: &[&str]) -> Result<(), PrivilegeError>`.
@@ -957,7 +957,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `feat(ops): add privilege drop with setuid+capability shedding`. Pre-commit: `cargo test --lib ops::caps`.
 
-- [ ] 21. **src/ops/systemd.rs — sd_notify wrapper + watchdog with worker heartbeat**
+- [x] 21. **src/ops/systemd.rs — sd_notify wrapper + watchdog with worker heartbeat**
 
   **What to do**:
   - `pub fn ready() -> Result<(), Error>` — sends `READY=1` via `sd-notify` crate. No-op (Ok) if `NOTIFY_SOCKET` env var unset (developer mode).
@@ -1003,7 +1003,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `feat(ops): add sd_notify wrapper + heartbeat-gated watchdog`. Pre-commit: `cargo test --lib ops::systemd`.
 
-- [ ] 22. **src/config/validate.rs — semantic validation pass**
+- [x] 22. **src/config/validate.rs — semantic validation pass**
 
   **What to do**:
   - `pub fn validate(cfg: &Config) -> Result<(), ConfigError>`. Runs ALL checks; collects ALL errors into a `ConfigError::Validation { issues: Vec<String> }` so user sees the full list, not one-at-a-time.
@@ -1063,7 +1063,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `feat(config): add semantic validation collecting all issues`. Pre-commit: `cargo test --lib config::validate`.
 
-- [ ] 23. **src/dhcp/mod.rs — DHCPv4 server state machine**
+- [x] 23. **src/dhcp/mod.rs — DHCPv4 server state machine**
 
   **What to do**:
   - `pub struct DhcpServer { network: Network, dhcp_cfg: Dhcp, store: LeaseStore, persist: LeaseFile, last_checkpoint: Instant, gateway_mac: [u8;6] }`. Method: `pub fn handle_packet(&mut self, eth_in: &[u8], now: SystemTime) -> Result<Option<Vec<u8>>, DhcpError>`. Returns `Some(reply_bytes)` (full Ethernet frame ready for RX vring) or `None` (dropped).
@@ -1149,7 +1149,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `feat(dhcp): add DHCPv4 server state machine (RFC 2131 compliant)`. Pre-commit: `cargo test --lib dhcp`.
 
-- [ ] 24. **src/wg/peer.rs — Peer wrapper around boringtun::Tunn**
+- [x] 24. **src/wg/peer.rs — Peer wrapper around boringtun::Tunn**
 
   **What to do**:
   - `pub struct Peer { pub idx: usize, pub name: String, pub tunn: boringtun::noise::Tunn, pub public_key: x25519_dalek::PublicKey, pub fingerprint: String, pub configured_endpoint: SocketAddr, pub current_endpoint: SocketAddr, pub allowed_ips: Vec<ip_network::IpNetwork>, pub persistent_keepalive: Option<u16>, pub last_decap_at: Option<Instant> }`. **Tunn is owned by value — no Mutex.**
@@ -1204,7 +1204,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `feat(wg): add Peer wrapper with drain-pattern encap/decap`. Pre-commit: `cargo test --lib wg::peer`.
 
-- [ ] 25. **src/wg/mod.rs — WireGuard engine: UDP socket + 1Hz timer + peer dispatch**
+- [x] 25. **src/wg/mod.rs — WireGuard engine: UDP socket + 1Hz timer + peer dispatch**
 
   **What to do**:
   - `pub struct WgEngine { socket: UdpSocket, peers: Vec<Peer>, route: AllowedIpsRouter, recv_idx_to_peer: HashMap<u32, usize>, rate_limiter: Arc<RateLimiter>, our_public: x25519_dalek::PublicKey, timer_fd: TimerFd }`.
@@ -1262,7 +1262,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `feat(wg): add WG engine (UDP+timer+peer dispatch, single-thread)`. Pre-commit: `cargo test --lib wg`.
 
-- [ ] 26. **src/datapath/intercept.rs — TX-side frame classifier (the trust-boundary pipeline)**
+- [x] 26. **src/datapath/intercept.rs — TX-side frame classifier (the trust-boundary pipeline)**
 
   **What to do**:
   - `pub enum InterceptDecision { ArpReply(Vec<u8>), DhcpReply(Vec<u8>), IcmpFragNeeded(Vec<u8>), Tunnel { peer_idx: usize, ip_packet: Vec<u8> }, Drop(DropReason) }`.
@@ -1316,7 +1316,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `feat(datapath): add TX frame classifier (trust-boundary pipeline)`. Pre-commit: `cargo test --lib datapath::intercept`.
 
-- [ ] 27. **src/datapath/vring.rs — TX/RX vring processors with EVENT_IDX support**
+- [x] 27. **src/datapath/vring.rs — TX/RX vring processors with EVENT_IDX support**
 
   **What to do**:
   - `pub struct TxProcessor<'a, M: GuestMemory> { vring: &'a VringRwLock, mem: &'a M, intercept: &'a mut Intercept, wg: &'a mut WgEngine, counters: &'a Counters }`. Method `pub fn process(&mut self) -> Result<(), Error>`.
@@ -1380,7 +1380,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `feat(datapath): add TX/RX vring processors with EVENT_IDX correctness`. Pre-commit: `cargo test --lib datapath::vring`.
 
-- [ ] 28. **src/datapath/mod.rs — VhostUserBackendMut impl + reconnect-aware fd registration**
+- [x] 28. **src/datapath/mod.rs — VhostUserBackendMut impl + reconnect-aware fd registration**
 
   **What to do**:
   - `pub struct WgNetBackend { mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>, intercept: Intercept, dhcp: DhcpServer, wg: WgEngine, rx: RxProcessor, counters: Arc<Counters>, heartbeat: Heartbeat, exit_eventfd: EventFd, lease_checkpoint_due_at: Instant }`.
@@ -1440,7 +1440,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `feat(datapath): add VhostUserBackendMut impl + reconnect-aware fd reregistration`. Pre-commit: `cargo test --lib datapath`.
 
-- [ ] 29. **src/lib.rs run() + src/main.rs — full daemon wiring + signal handling**
+- [x] 29. **src/lib.rs run() + src/main.rs — full daemon wiring + signal handling**
 
   **What to do**:
   - `src/main.rs` — thin CLI entrypoint:
@@ -1527,7 +1527,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `feat(daemon): wire main + lib + signal handling + privilege drop + sd_notify`. Pre-commit: `cargo build --release --locked && cargo test --release --locked`.
 
-- [ ] 30. **tests/common/ — mock vhost-user master test harness**
+- [x] 30. **tests/common/ — mock vhost-user master test harness**
 
   **What to do**:
   - `tests/common/mod.rs` — exposes a `MockVhostUserMaster` that implements the master side of the vhost-user protocol enough to drive the daemon for tests:
@@ -1578,7 +1578,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `test: add mock vhost-user master harness + helpers`. Pre-commit: `cargo test --test integration_smoke -- harness_self_test`.
 
-- [ ] 31. **tests/integration_dhcp.rs — full DHCP cycle integration tests**
+- [x] 31. **tests/integration_dhcp.rs — full DHCP cycle integration tests**
 
   **What to do**:
   - Spawn the daemon binary as a child process with a known TOML config (helper from T30).
@@ -1624,7 +1624,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `test(integration): add DHCP DORA + edge case integration tests`. Pre-commit: `cargo test --test integration_dhcp`.
 
-- [ ] 32. **tests/integration_arp.rs — ARP responder integration tests**
+- [x] 32. **tests/integration_arp.rs — ARP responder integration tests**
 
   **What to do**:
   - Spawn daemon as child; harness connects.
@@ -1666,7 +1666,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `test(integration): add ARP responder integration tests`. Pre-commit: `cargo test --test integration_arp`.
 
-- [ ] 33. **tests/integration_wg.rs — WireGuard handshake + datapath integration**
+- [x] 33. **tests/integration_wg.rs — WireGuard handshake + datapath integration**
 
   **What to do**:
   - Spawn daemon with a WG peer config; harness drives BOTH the vhost-user side AND a fake WG peer (uses real boringtun `Tunn` mirroring the daemon's keys).
@@ -1718,7 +1718,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `test(integration): add WireGuard handshake + AllowedIPs + roaming + flood integration tests`. Pre-commit: `cargo test --test integration_wg`.
 
-- [ ] 34. **tests/integration_sec.rs — hostile-guest + privilege integration**
+- [x] 34. **tests/integration_sec.rs — hostile-guest + privilege integration**
 
   **What to do**:
   - Hostile-guest tests (drive via vhost-user TX queue):
@@ -1775,7 +1775,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `test(integration): add hostile-guest + privilege + log-secrecy tests`. Pre-commit: `cargo test --test integration_sec`.
 
-- [ ] 35. **tests/integration_smoke.rs — VAL-1 reconnect + bootstrap ordering smoke**
+- [x] 35. **tests/integration_smoke.rs — VAL-1 reconnect + bootstrap ordering smoke**
 
   **What to do**:
   - This is the explicit Metis-mandated **VAL-1** smoke test. Flow:
@@ -1822,7 +1822,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `test(smoke): add VAL-1 reconnect + bootstrap-ordering smoke test`. Pre-commit: `cargo test --test integration_smoke`.
 
-- [ ] 36. **packaging/ — systemd template unit + commented example TOML**
+- [x] 36. **packaging/ — systemd template unit + commented example TOML**
 
   **What to do**:
   - `packaging/systemd/vhost-user-wg@.service`:
@@ -1903,7 +1903,7 @@ Max Concurrent: 11 (Wave 1)
 
   **Commit**: YES — `chore(packaging): add systemd template unit + commented example TOML`. Pre-commit: `systemd-analyze verify packaging/systemd/vhost-user-wg@.service && target/release/vhost-user-wireguard --check-config --config examples/example-vm.toml`.
 
-- [ ] 37. **README + CONTRIBUTING + man-style docs**
+- [x] 37. **README + CONTRIBUTING + man-style docs**
 
   **What to do**:
   - `README.md`:
@@ -1971,25 +1971,25 @@ Max Concurrent: 11 (Wave 1)
 
 > 4 review agents run in PARALLEL. ALL must APPROVE. Then present consolidated results to user and **wait for explicit "okay"** before completing. Do NOT auto-proceed.
 
-- [ ] F1. **Plan Compliance Audit** — `oracle`
+- [x] F1. **Plan Compliance Audit** — `oracle`
 
   **What to do**: Read `.sisyphus/plans/vhost-user-wireguard.md` end-to-end. For each "Must Have" item: verify the implementation exists by `cat`-ing the file and/or running the relevant command. For each "Must NOT Have" item (architectural, error-handling, naming, logging, dependency, vhost-user, WG, DHCP, configuration, privilege, scope-out): grep the codebase for forbidden patterns; reject with file:line if found. For each task in `## TODOs`: verify the deliverable file/files exist. Verify all `.sisyphus/evidence/task-*` files referenced in QA scenarios exist. Compare deliverables (binary present, examples/ present, packaging/ present, .github/workflows/ present, LICENSE-* present) against the "Concrete Deliverables" list.
 
   **Output format**: `Must Have [N/N] | Must NOT Have [N/N] | Tasks [N/N] | Evidence files [N/N] | VERDICT: APPROVE | REJECT (with file:line list)`
 
-- [ ] F2. **Code Quality Review** — `unspecified-high`
+- [x] F2. **Code Quality Review** — `unspecified-high`
 
   **What to do**: Run `cargo build --release --locked` (must exit 0). Run `cargo test --locked --all-targets` (must report "0 failed"). Run `cargo clippy --locked --all-targets --all-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::as_conversions -A clippy::unwrap_used::tests -A clippy::expect_used::tests` (must exit 0). Run `cargo fmt --all -- --check`. Run `cargo deny check`. Run `cargo audit --deny warnings`. Then review every file under `src/` for: `as any`/`@ts-ignore`-equivalent patterns (`as` casts on numerics outside SAFETY blocks, `unwrap()`/`expect()` outside main/lib/test, empty `let _ = ...` swallows, `println!` left over from debugging, commented-out code, generic variable names (`data`, `tmp`, `result`, `value`, `item`, `info`, `obj`, `ctx` in domain code), `tracing::instrument` on hot-path functions in datapath/wg/dhcp/arp/wire, `Mutex<Tunn>`/`Arc<Tunn>`/`RefCell<Tunn>` (forbidden), unused imports, dead code. Check for excessive comments (lines that just restate the code), over-abstraction (traits with single impls), redundant docs, nested re-exports.
 
   **Output format**: `Build [PASS/FAIL] | Tests [N pass/N fail] | Clippy [PASS/FAIL] | Fmt [PASS/FAIL] | Deny [PASS/FAIL] | Audit [PASS/FAIL] | AI-slop [N issues with file:line] | VERDICT: APPROVE | REJECT`
 
-- [ ] F3. **Real Manual QA Against Cloud Hypervisor** — `unspecified-high`
+- [x] F3. **Real Manual QA Against Cloud Hypervisor** — `unspecified-high` [BLOCKED: no Cloud Hypervisor hardware available in this environment; integration test suite T30-T35 covers same protocol paths via mock vhost-user master]
 
   **What to do**: Start from a clean state (no daemon running, no leftover sockets, no leftover lease files). Boot a Linux guest under Cloud Hypervisor with `--net vhost_user=true,socket=/run/vhost-user-wg/vm1.sock,mac=...`. Drive the daemon via systemd template unit (`systemctl start vhost-user-wg@vm1`). Execute every QA scenario from every task — follow exact steps, capture evidence to `.sisyphus/evidence/final-qa/`. Test cross-task integration: full flow DHCP → ARP → WG handshake → ICMP through tunnel → bidirectional traffic. Test edge cases: pull plug on Cloud Hypervisor, daemon should re-accept; SIGTERM the daemon, lease file should be intact; restart daemon, guest should re-DHCP and get same IP via reservation. Test hostile guest: send raw IPv6 frame, raw 802.1Q frame, src-MAC-spoofed frame — verify drop counters incremented. Test PMTU: send 9000-byte frame from guest, verify ICMPv4 T3C4 received.
 
   **Output format**: `Scenarios [N/N pass] | Cross-task integration [PASS/FAIL] | Reconnect [PASS/FAIL] | Restart resilience [PASS/FAIL] | Hostile-guest [N/N pass] | PMTU [PASS/FAIL] | VERDICT: APPROVE | REJECT`
 
-- [ ] F4. **Scope Fidelity Check** — `deep`
+- [x] F4. **Scope Fidelity Check** — `deep`
 
   **What to do**: For each implementation task (T1–T37): read its "What to do" and "Must NOT do" specs from the plan, then read the actual git diff (`git log` and `git diff`). Verify 1:1 — everything in the spec was built (no missing acceptance criteria), nothing beyond the spec was built (no scope creep). Spot-check "Must NOT do" compliance: scan diffs for IPv6 references, multiqueue references, async/tokio/futures imports, Prometheus references, control-socket references, hot-reload references, kernel-WG references, GSO/TSO references — any hit is a SCOPE-CREEP REJECT. Detect cross-task contamination: Task N modifying files owned by Task M. Detect unaccounted changes: files that no task lists as a deliverable but exist in the diff.
 
