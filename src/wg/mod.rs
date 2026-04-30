@@ -237,6 +237,7 @@ impl WgEngine {
         if let Some(&idx) = self.recv_idx_to_peer.get(&receiver_idx) {
             return Some(idx);
         }
+        // SAFETY: receiver_idx >> 8 is at most u32::MAX >> 8 = 16_777_215, fits in usize on all supported platforms
         let hint = (receiver_idx >> 8) as usize;
         if hint < self.peers.len() {
             return Some(hint);
