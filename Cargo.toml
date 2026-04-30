@@ -55,6 +55,7 @@ predicates = "3"
 # Cargo unifies feature flags between [dependencies] and [dev-dependencies].
 vhost = { version = "0.16", features = ["vhost-user-frontend"] }
 vmm-sys-util = "0.15"
+libc = "0.2"
 
 [profile.release]
 lto = "thin"

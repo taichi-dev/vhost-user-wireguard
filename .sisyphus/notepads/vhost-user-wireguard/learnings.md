@@ -527,3 +527,50 @@ Public API surface is stable; impl is `unimplemented!()` for:
 - `MockVhostUserMaster::read_rx_frame` — needs used ring poll + descriptor read.
 - `MockVhostUserMaster::disconnect_and_reconnect` data plane — currently re-negotiates features only; vring re-arm pending.
 - `tests/integration_smoke.rs::reconnect_re_registers` — depends on the data plane.
+
+## T30 (data-plane unit): shared-memory rings + write_tx/read_rx + reconnect (2026-04-30)
+
+### CRITICAL: SET_VRING_ADDR addresses are VMM userspace addresses, NOT GPAs
+This was the root cause of an hours-long flaky-failure debugging detour. The vhost-user-backend handler `set_vring_addr` calls `vmm_va_to_gpa(descriptor)` on every address it receives, where `vmm_va_to_gpa(vmm_va) = vmm_va - mapping.vmm_addr + mapping.gpa_base`. This means the master must pass `userspace_addr + offset` as the descriptor table / avail / used ring addresses in `VringConfigData`, NOT the raw guest physical offsets. Confirmed via `vhost-user-backend-0.22.0/src/handler.rs:179-187`. By contrast, descriptor `addr` fields inside the descriptor table ARE guest physical addresses (read straight by virtio-queue's GuestMemory ops), so for our `guest_phys_addr=0` mapping they happen to equal file offsets. The two address spaces look identical when `guest_phys_addr=0` BUT the API expects them on different sides.
+
+### Symptom of wrong addresses: SocketBroken / BrokenPipe at SET_VRING_KICK
+With wrong addresses, `set_vring_addr` returns `MissingMemoryMapping` from `vmm_va_to_gpa`, the daemon's worker thread propagates the error, vhost-user-backend's handler thread exits, the framework closes the connection — but the daemon binary's `serve()` returns Ok on Disconnected. Master sees the next message (`set_vring_call` or `set_vring_kick`) fail with `SocketBroken(BrokenPipe)`. Daemon stderr is empty because no panic occurs. /proc/PID/status shows daemon "R (running)" because the main thread is in cleanup after `serve()` returned, not panicking. This was misdiagnosed as a race condition initially because it was timing-sensitive (the message preceding the close varied: sometimes set_vring_num, sometimes set_vring_kick).
+
+### vhost-user `Frontend` requires VMM userspace base from our local mmap
+`let userspace_addr = self.mem.base() as u64;` — pass the mmap pointer back as `userspace_addr` in `VhostUserMemoryRegionInfo` AND add it to every `desc_table_addr/avail_ring_addr/used_ring_addr` in `VringConfigData`. The pointer-as-u64 cast is fine on x86_64 / aarch64 (both ≤ 2^48 user VA).
+
+### `vhost::backend` module is private; types are re-exported at crate root
+`use vhost::{VhostBackend, VhostUserMemoryRegionInfo, VringConfigData}` works; `use vhost::backend::*` does NOT (the module is `mod backend;` — pub use re-exports it at line 41 of lib.rs). Always check the crate root for vhost types before importing.
+
+### Production daemon serves only ONE connection per process
+`vhost::vhost_user::Frontend::set_vring_enable` requires `PROTOCOL_FEATURES` to be acked. Our daemon doesn't advertise `VhostUserVirtioFeatures::PROTOCOL_FEATURES` (bit 30) in its features bitmap. The framework's `set_features` handler auto-enables all rings when PROTOCOL_FEATURES is NOT acked, so we don't NEED to call set_vring_enable — but we also can't reach the framework's "stay alive across multiple connections" path because that requires PROTOCOL_FEATURES too. `daemon.serve()` returns after one disconnect, our `run()` cleans up, the binary exits. Therefore `disconnect_and_reconnect()` must KILL and RESPAWN the daemon child rather than reusing the existing process. This is documented in inherited wisdom (`run_serve_loop` does NOT call `register_external_fds`) and is a known gap; the harness's respawn-based reconnect still validates the master-side reconnect path end-to-end.
+
+### Why we explicitly drop `VIRTIO_RING_F_EVENT_IDX` from the acked mask
+`acked_virtio = advertised & !(1u64 << VIRTIO_RING_F_EVENT_IDX_BIT)` — implementing the EVENT_IDX dance (avail_event/used_event slots, suppression logic) doubles the harness complexity for zero test signal. The daemon's `set_event_idx(false)` path is exercised exactly the same as `set_event_idx(true)` for the message-flow we actually validate. Test must check `advertised_virtio_features` (NOT `acked_virtio_features`) when asserting the daemon advertises EVENT_IDX.
+
+### Shared-memory layout choices that mattered
+- 4KB (one page) per descriptor data buffer × 256 descriptors = 1 MB per queue. ARP/DHCP frames fit easily; MTU-1420 frames also fit with the 12-byte vnet_hdr prefix.
+- Page-aligned ring locations (one page each for desc/avail/used) keep cache-line / DMA assumptions clean even though we don't use real DMA.
+- Total 3 MB region. Page-aligned sizes are required (mmap rejects non-page-multiples on Linux).
+- `tempfile::tempfile()` returns an unlinked file in `/tmp`; `set_len()` does ftruncate; `libc::mmap` with `MAP_SHARED` makes the daemon's mmap of the same fd see the same pages.
+
+### `rustix::mm` is feature-gated; `libc` is the simpler test-only escape hatch
+`rustix = { features = ["mm"] }` would add a feature flag affecting production builds. Adding `libc = "0.2"` to dev-deps only is cleaner — `libc::mmap`/`libc::munmap` are universally available, and the unsafe surface is tiny (4 calls). `tempfile::tempfile()` + `File::set_len()` + `libc::mmap` is the canonical test-only mmap idiom in vmm crates.
+
+### Polling vs eventfd waiting on call fd
+The harness polls the ring's `used.idx` directly rather than blocking on the call eventfd because (a) the call eventfd is only fired with EVENT_IDX off when `used.idx` advances at all (and consumes the wakeup, so a second waiter would miss it); (b) polling is trivially cancellable with a deadline; (c) it doesn't require careful integration with epoll. 2ms sleep granularity is fine for tests — the daemon responds to ARP in <1ms in practice.
+
+### MRG_RXBUF: in our test scenarios `num_buffers` is always 1
+The daemon's `RxProcessor::flush` claims chained buffers based on frame size, but ETH frames < 1500 bytes always fit in a single 4KB buffer. `used_elem.len = vnet_hdr_len + frame_len` per RX completion. If we ever test jumbo frames (>4KB - 12), we'd need a multi-buffer reader.
+
+### Initial RX descriptor pre-publish ordering
+Pre-populate the descriptor table FIRST (256 entries, all writable, addr=RX_BUFFER_BASE+i*4096), THEN write all 256 entries into avail.ring[0..256], THEN bump avail.idx=256, THEN `fence(SeqCst)`, THEN write avail.idx to memory, THEN `fence(SeqCst)`. The fences matter because the daemon's worker thread may already be running on another CPU; without fences the daemon could observe avail.idx before the descriptor writes are visible.
+
+### Daemon's process-already-exiting gotcha during disconnect
+`UnixStream::write` after the daemon's worker thread has closed the socket can return EPIPE. After `frontend = None` (drops the stream), the daemon's `serve()` returns, `run()` proceeds to its cleanup phase. Need `daemon.shutdown()` before respawning AND need to wait for the socket file to be removed (or remove it manually) — otherwise the new daemon's `Listener::new` fails with EADDRINUSE.
+
+### Verification (T30 data-plane unit)
+- `cargo test --test integration_smoke` — 3 tests pass: harness_self_test (negotiation), test_write_and_read_frame (ARP TX→RX roundtrip through the full pipeline), test_disconnect_and_reconnect_arp_roundtrip (kill+respawn+second roundtrip).
+- 5 consecutive runs of the full integration suite all pass — no flakes after fixing the address-translation bug.
+- `cargo test --lib` — 161 tests still pass.
+- `cargo clippy --tests` — zero warnings on harness or smoke files.
