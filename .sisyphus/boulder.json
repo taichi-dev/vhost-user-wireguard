@@ -11,5 +11,24 @@
   },
   "plan_name": "vhost-user-wireguard",
   "agent": "atlas",
-  "task_sessions": {}
+  "task_sessions": {
+    "todo:1": {
+      "task_key": "todo:1",
+      "task_label": "1",
+      "task_title": "**Project scaffolding** — Cargo.toml, license files, .gitignore, repo skeleton",
+      "session_id": "ses_223b5dc50ffeg7OSP6rdWN51NK",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-04-30T02:52:01.169Z"
+    },
+    "todo:15": {
+      "task_key": "todo:15",
+      "task_label": "15",
+      "task_title": "**src/dhcp/options.rs — DHCP option builder for ACK/OFFER/NAK**",
+      "session_id": "ses_2239832c3ffekP4IPhVSFqTg15",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-04-30T03:23:32.980Z"
+    }
+  }
 }

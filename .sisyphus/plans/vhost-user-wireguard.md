@@ -614,7 +614,7 @@ Max Concurrent: 11 (Wave 1)
 > Every task includes: Recommended Agent Profile + Parallelization + References + Acceptance Criteria + QA Scenarios + Commit info.
 > A task without QA Scenarios is INCOMPLETE and will be rejected by F1/F2.
 
-- [ ] 1. **Project scaffolding** — Cargo.toml, license files, .gitignore, repo skeleton
+- [x] 1. **Project scaffolding** — Cargo.toml, license files, .gitignore, repo skeleton
 
   **What to do**:
   - `cargo init --bin --name vhost-user-wireguard` in the working directory.

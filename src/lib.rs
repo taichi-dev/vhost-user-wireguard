@@ -4,6 +4,7 @@ pub mod arp;
 pub mod config;
 pub mod datapath;
 pub mod dhcp;
+pub mod error;
 pub mod ops;
 pub mod wire;
 pub mod wg;
