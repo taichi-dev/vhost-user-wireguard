@@ -7,10 +7,15 @@ Wants=network-online.target
 [Service]
 Type=notify
 NotifyAccess=main
-WatchdogSec=30s
+# WatchdogSec is intentionally unset: the daemon's sd_notify(WATCHDOG=1)
+# ping loop is not yet implemented. Set this once the daemon supports it.
 ExecStart=/usr/bin/vhost-user-wireguard --config /etc/vhost-user-wg/%i.toml
 Restart=on-failure
 RestartSec=2s
+# The daemon's serve loop blocks until the vhost-user master disconnects.
+# SIGTERM signals the signal-handler thread but cannot unwind daemon.wait()
+# on its own, so cap the SIGTERM grace period and let systemd SIGKILL.
+TimeoutStopSec=5s
 
 # Privilege & sandboxing
 User=vhost-user-wg
@@ -24,9 +29,9 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-ReadWritePaths=/var/lib/vhost-user-wg /run/vhost-user-wg
+ReadWritePaths=/var/lib/vhost-user-wireguard /run/vhost-user-wg
 RuntimeDirectory=vhost-user-wg
-StateDirectory=vhost-user-wg
+StateDirectory=vhost-user-wireguard
 StateDirectoryMode=0700
 
 # Resource limits

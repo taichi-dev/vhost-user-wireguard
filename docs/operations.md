@@ -192,6 +192,87 @@ systemctl stop 'vhost-user-wg@*.service'
 
 ---
 
+## Embedding the Config in libvirt XML
+
+For libvirt deployments, the daemon TOML config can live inside the domain
+XML under `<metadata>`. A qemu hook reads it on `prepare/begin` and starts
+the systemd unit; on `release/end` it stops the unit and removes the file.
+This keeps the VM definition and its network policy in a single editable
+artefact (`virsh edit <domain>`).
+
+### Install the hook
+
+```bash
+sudo install -m 0755 packaging/libvirt-hook/qemu /etc/libvirt/hooks/qemu
+sudo systemctl restart libvirtd     # libvirtd loads hooks at startup
+```
+
+The hook is a Python 3 script with no third-party dependencies. It silently
+ignores any domain that has no `<vuwg:config>` metadata block.
+
+### Author the domain
+
+See `examples/vm-with-embedded-config.xml` for a complete, ready-to-edit
+template. The relevant fragment is:
+
+```xml
+<domain type='kvm'>
+  <name>vm1</name>
+  ...
+  <metadata>
+    <vuwg:config xmlns:vuwg='https://github.com/taichi-dev/vhost-user-wireguard'>
+      <vuwg:toml><![CDATA[
+[vm]
+mac = "52:54:00:12:34:01"
+mtu = 1420
+ip  = "10.66.66.2"
+
+[vhost_user]
+socket = "/run/vhost-user-wg/vm1.sock"
+...
+]]></vuwg:toml>
+    </vuwg:config>
+  </metadata>
+  <devices>
+    <interface type='vhostuser'>
+      <mac address='52:54:00:12:34:01'/>
+      <source type='unix' path='/run/vhost-user-wg/vm1.sock' mode='client'/>
+      <model type='virtio'/>
+      <driver queues='1' rx_queue_size='256' tx_queue_size='256'/>
+    </interface>
+  </devices>
+</domain>
+```
+
+The socket path in `<interface>` MUST match `[vhost_user].socket` in the
+embedded TOML. By convention the daemon's socket lives at
+`/run/vhost-user-wg/<domain>.sock`, which is also where the hook expects to
+find it.
+
+### Lifecycle
+
+| libvirt event       | hook action                                                    |
+|---------------------|---------------------------------------------------------------|
+| `prepare/begin`     | Write `/etc/vhost-user-wg/<domain>.toml`, `systemctl start vhost-user-wg@<domain>`, wait for socket, chgrp `libvirt-qemu` (or fall back to `chmod 0666`). |
+| `release/end`       | `systemctl stop vhost-user-wg@<domain>`, remove the TOML file.   |
+| Any other event/phase | No-op.                                                       |
+
+Hook output is logged to the journal under tag `vhost-user-wg-hook`:
+
+```bash
+journalctl -t vhost-user-wg-hook -f
+```
+
+### Editing the config
+
+`virsh edit <domain>` opens the full XML in `$EDITOR`. Modify the embedded
+TOML and save. The change applies on the next `virsh start <domain>`. Live
+edits to a running domain are not reloaded - stop and start the VM (or run
+`systemctl restart vhost-user-wg@<domain>` after manually rewriting the
+TOML file) to pick up the new config.
+
+---
+
 ## Log Format
 
 ### Text format (default)

@@ -1,0 +1,106 @@
+<!--
+  Example libvirt domain with the vhost-user-wireguard daemon config
+  embedded in the domain metadata.
+
+  The qemu hook at packaging/libvirt-hook/qemu reads the <vuwg:toml>
+  element on prepare/begin, writes /etc/vhost-user-wg/<domain>.toml,
+  and starts the vhost-user-wg@<domain>.service systemd unit.
+
+  Define the domain with:
+
+      virsh define examples/vm-with-embedded-config.xml
+
+  Edit the embedded TOML in place with:
+
+      virsh edit <domain>
+
+  Required for vhost-user:
+    * <memoryBacking><source type='memfd'/><access mode='shared'/>
+    * <interface type='vhostuser'> with <source ... mode='client'/> and
+      <driver queues='1'/> (libvirt otherwise asks for multi-queue,
+      which the daemon does not support).
+-->
+<domain type='kvm'>
+  <name>vhost-wg-example</name>
+  <memory unit='MiB'>1024</memory>
+  <currentMemory unit='MiB'>1024</currentMemory>
+  <memoryBacking>
+    <source type='memfd'/>
+    <access mode='shared'/>
+  </memoryBacking>
+  <vcpu placement='static'>1</vcpu>
+
+  <metadata>
+    <vuwg:config xmlns:vuwg='https://github.com/taichi-dev/vhost-user-wireguard'>
+      <vuwg:toml><![CDATA[
+[vm]
+mac = "52:54:00:12:34:01"
+mtu = 1420
+ip  = "10.66.66.2"
+
+[vhost_user]
+socket     = "/run/vhost-user-wg/vhost-wg-example.sock"
+queue_size = 256
+num_queues = 2
+
+[network]
+subnet  = "10.66.66.0/30"
+gateway = "10.66.66.1"
+dns     = ["1.1.1.1", "8.8.8.8"]
+
+[wireguard]
+# Either inline private_key or private_key_file (mode 0600).
+private_key_file = "/etc/vhost-user-wg/vhost-wg-example.key"
+listen_port      = 51820
+
+[[wireguard.peers]]
+name        = "remote-gateway"
+public_key  = "REPLACE_WITH_PEER_PUBKEY_BASE64============"
+endpoint    = "203.0.113.1:51820"
+allowed_ips = ["0.0.0.0/0"]
+persistent_keepalive = 25
+
+[dhcp]
+decline_probation_secs = 3600
+checkpoint_secs        = 60
+reservations           = []
+
+[dhcp.pool]
+start = "10.66.66.2"
+end   = "10.66.66.2"
+]]></vuwg:toml>
+    </vuwg:config>
+  </metadata>
+
+  <os>
+    <type arch='x86_64' machine='pc-q35-noble'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
+  <cpu mode='host-passthrough'/>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+
+    <!--
+      The vhost-user socket path here MUST match [vhost_user].socket
+      in the embedded TOML above. The daemon listens on this socket;
+      QEMU connects as a client (mode='client').
+    -->
+    <interface type='vhostuser'>
+      <mac address='52:54:00:12:34:01'/>
+      <source type='unix' path='/run/vhost-user-wg/vhost-wg-example.sock' mode='client'/>
+      <model type='virtio'/>
+      <driver queues='1' rx_queue_size='256' tx_queue_size='256'/>
+    </interface>
+
+    <serial type='pty'>
+      <target type='isa-serial' port='0'><model name='isa-serial'/></target>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+  </devices>
+</domain>
