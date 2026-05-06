@@ -9,7 +9,7 @@ Type=notify
 NotifyAccess=main
 # WatchdogSec is intentionally unset: the daemon's sd_notify(WATCHDOG=1)
 # ping loop is not yet implemented. Set this once the daemon supports it.
-ExecStart=/usr/bin/vhost-user-wireguard --config /etc/vhost-user-wg/%i.toml
+ExecStart=/usr/bin/vhost-user-wireguard --config /run/vhost-user-wg/%i.toml
 Restart=on-failure
 RestartSec=2s
 # The daemon's serve loop blocks until the vhost-user master disconnects.
@@ -31,6 +31,11 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 ReadWritePaths=/var/lib/vhost-user-wireguard /run/vhost-user-wg
 RuntimeDirectory=vhost-user-wg
+# Concurrent VMs share /run/vhost-user-wg/ for both their config TOML
+# (written by the libvirt hook) and their socket. Without preserve=yes,
+# stopping one instance would delete the directory out from under the
+# other instances still using it.
+RuntimeDirectoryPreserve=yes
 StateDirectory=vhost-user-wireguard
 StateDirectoryMode=0700
 

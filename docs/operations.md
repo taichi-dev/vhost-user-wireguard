@@ -195,20 +195,53 @@ systemctl stop 'vhost-user-wg@*.service'
 ## Embedding the Config in libvirt XML
 
 For libvirt deployments, the daemon TOML config can live inside the domain
-XML under `<metadata>`. A qemu hook reads it on `prepare/begin` and starts
-the systemd unit; on `release/end` it stops the unit and removes the file.
-This keeps the VM definition and its network policy in a single editable
-artefact (`virsh edit <domain>`).
+XML under `<metadata>`. A qemu hook reads it on `prepare/begin`, writes it
+to `/run/vhost-user-wg/<domain>.toml` (ephemeral tmpfs, recreated on every
+VM start), and starts the systemd unit. On `release/end` it stops the unit
+and removes the file. This keeps the VM definition and its network policy
+in a single editable artefact (`virsh edit <domain>`).
 
 ### Install the hook
 
+libvirt only invokes a single hook file at `/etc/libvirt/hooks/qemu`, which
+makes it awkward for multiple tools to coexist. vhost-user-wireguard ships
+its hook as a *drop-in* under `qemu.d/` plus a reference dispatcher script
+that runs every drop-in in turn. Pick the install path that matches your
+existing setup.
+
+**Path A — no existing libvirt qemu hook (typical):** install the reference
+dispatcher and our drop-in.
+
 ```bash
+# Reference dispatcher (only when /etc/libvirt/hooks/qemu does not exist).
 sudo install -m 0755 packaging/libvirt-hook/qemu /etc/libvirt/hooks/qemu
+
+# The drop-in (always).
+sudo install -d -m 0755 /etc/libvirt/hooks/qemu.d
+sudo install -m 0755 packaging/libvirt-hook/qemu.d/vhost-user-wg \
+    /etc/libvirt/hooks/qemu.d/vhost-user-wg
+
 sudo systemctl restart libvirtd     # libvirtd loads hooks at startup
 ```
 
-The hook is a Python 3 script with no third-party dependencies. It silently
-ignores any domain that has no `<vuwg:config>` metadata block.
+**Path B — you already use the `qemu.d/` dispatcher pattern** (e.g.,
+VFIO-Tools): install only the drop-in; your existing dispatcher will pick
+it up on the next libvirtd restart.
+
+```bash
+sudo install -m 0755 packaging/libvirt-hook/qemu.d/vhost-user-wg \
+    /etc/libvirt/hooks/qemu.d/vhost-user-wg
+sudo systemctl restart libvirtd
+```
+
+**Path C — you have a custom `/etc/libvirt/hooks/qemu` script:** do **not**
+overwrite it. Either migrate to the drop-in pattern (move your existing
+logic into `qemu.d/<your-tool>` and install our reference dispatcher), or
+invoke our drop-in from your hook with `exec /etc/libvirt/hooks/qemu.d/vhost-user-wg "$@"` (preserving stdin).
+
+The drop-in is a Python 3 script with no third-party dependencies. It
+silently exits 0 for any domain that has no `<vuwg:config>` metadata block,
+so it is safe to run for every VM.
 
 ### Author the domain
 
@@ -253,8 +286,8 @@ find it.
 
 | libvirt event       | hook action                                                    |
 |---------------------|---------------------------------------------------------------|
-| `prepare/begin`     | Write `/etc/vhost-user-wg/<domain>.toml`, `systemctl start vhost-user-wg@<domain>`, wait for socket, chgrp `libvirt-qemu` (or fall back to `chmod 0666`). |
-| `release/end`       | `systemctl stop vhost-user-wg@<domain>`, remove the TOML file.   |
+| `prepare/begin`     | Write `/run/vhost-user-wg/<domain>.toml` (mode 0600, owned by `vhost-user-wg`), `systemctl start vhost-user-wg@<domain>`, wait for socket, chgrp `libvirt-qemu` (or fall back to `chmod 0666`). |
+| `release/end`       | `systemctl stop vhost-user-wg@<domain>`, remove the TOML file. |
 | Any other event/phase | No-op.                                                       |
 
 Hook output is logged to the journal under tag `vhost-user-wg-hook`:
@@ -266,10 +299,10 @@ journalctl -t vhost-user-wg-hook -f
 ### Editing the config
 
 `virsh edit <domain>` opens the full XML in `$EDITOR`. Modify the embedded
-TOML and save. The change applies on the next `virsh start <domain>`. Live
-edits to a running domain are not reloaded - stop and start the VM (or run
-`systemctl restart vhost-user-wg@<domain>` after manually rewriting the
-TOML file) to pick up the new config.
+TOML and save. The change applies on the next `virsh start <domain>` — live
+edits to a running domain are not reloaded; stop and start the VM. The
+rendered TOML at `/run/vhost-user-wg/<domain>.toml` is overwritten by the
+hook on every start, so the canonical source of truth is always the XML.
 
 ---
 

@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# libvirt qemu drop-in for vhost-user-wireguard.
+#
+# Reads a TOML config embedded under <metadata><vuwg:config><vuwg:toml> in
+# the domain XML, writes it to /run/vhost-user-wg/<domain>.toml (ephemeral
+# tmpfs), and starts the vhost-user-wg@<domain>.service systemd unit on VM
+# start. Tears the unit down and removes the config on VM stop.
+#
+# This script is a *drop-in*. libvirt only invokes a single hook file at
+# /etc/libvirt/hooks/qemu, so it must be wired up via a dispatcher that
+# iterates /etc/libvirt/hooks/qemu.d/ - see packaging/libvirt-hook/qemu for
+# a reference dispatcher that does exactly that.
+#
+# Install:
+#     sudo install -d -m 0755 /etc/libvirt/hooks/qemu.d
+#     sudo install -m 0755 packaging/libvirt-hook/qemu.d/vhost-user-wg \
+#         /etc/libvirt/hooks/qemu.d/vhost-user-wg
+#     # Plus a dispatcher at /etc/libvirt/hooks/qemu (see above).
+#     sudo systemctl restart libvirtd     # libvirtd loads hooks at startup
+#
+# libvirt invocation (forwarded by the dispatcher):
+#     /etc/libvirt/hooks/qemu.d/vhost-user-wg <domain> <event> <phase> <unused>
+# with the full domain XML on stdin (events: prepare, start, started,
+# stopped, release, migrate, restore, reconnect, attach).
+#
+# We act on:
+#   prepare/begin  - before QEMU is forked: extract config, start daemon,
+#                    chmod socket so libvirt-qemu can connect.
+#   release/end    - after QEMU has exited: stop daemon, remove config.
+#
+# Domains that have no <vuwg:config> are silently ignored (exit 0).
+
+from __future__ import annotations
+
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Optional
+
+NS = "https://github.com/taichi-dev/vhost-user-wireguard"
+RUNTIME_DIR = Path("/run/vhost-user-wg")  # ephemeral, tmpfs; same dir as the socket
+DAEMON_USER = "vhost-user-wg"             # owner the daemon runs as
+SERVICE_TEMPLATE = "vhost-user-wg@{domain}.service"
+SOCKET_WAIT_SECS = 10.0
+SOCKET_POLL_INTERVAL = 0.1
+QEMU_GROUPS = ("libvirt-qemu", "qemu", "kvm")  # try in order, first match wins
+LOG_TAG = "vhost-user-wg-hook"
+
+
+def log(msg: str) -> None:
+    """Best-effort logging via systemd-cat (falls back to stderr)."""
+    try:
+        subprocess.run(
+            ["systemd-cat", "-t", LOG_TAG, "-p", "info"],
+            input=msg.encode(),
+            timeout=2,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        print(f"{LOG_TAG}: {msg}", file=sys.stderr)
+
+
+def extract_toml(xml_text: str) -> Optional[str]:
+    """Return TOML text from <metadata><vuwg:config><toml>...</toml>, or None."""
+    if not xml_text.strip():
+        return None
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        log(f"parse error: {exc}")
+        return None
+    # Prefer the namespaced lookup; fall back to local-name match if libvirt
+    # ever ships the metadata with a different prefix declaration.
+    toml = root.find(f"./metadata/{{{NS}}}config/{{{NS}}}toml")
+    if toml is None:
+        for elem in root.iter():
+            if elem.tag.endswith("}toml") and NS in elem.tag:
+                toml = elem
+                break
+    if toml is None or toml.text is None:
+        return None
+    return toml.text.strip() + "\n"
+
+
+def detect_qemu_group() -> Optional[str]:
+    import grp
+
+    for group in QEMU_GROUPS:
+        try:
+            grp.getgrnam(group)
+            return group
+        except KeyError:
+            continue
+    return None
+
+
+def chmod_socket_for_qemu(sock_path: Path) -> None:
+    group = detect_qemu_group()
+    if group is not None:
+        try:
+            shutil.chown(sock_path, group=group)
+            sock_path.chmod(0o660)
+            log(f"chgrp {group} + chmod 0660 on {sock_path}")
+            return
+        except (OSError, LookupError) as exc:
+            log(f"chgrp {group} failed ({exc}); falling back to 0666")
+    sock_path.chmod(0o666)
+
+
+def chown_to_daemon(path: Path) -> None:
+    """Best-effort chown to the daemon's user/group. Logs and continues on failure.
+
+    The config may contain inline WG private keys, so the file is mode 0600 and
+    must be readable by the daemon's User=/Group= (vhost-user-wg).
+    """
+    import grp
+    import pwd
+
+    try:
+        uid = pwd.getpwnam(DAEMON_USER).pw_uid
+        gid = grp.getgrnam(DAEMON_USER).gr_gid
+        os.chown(path, uid, gid)
+    except (KeyError, OSError) as exc:
+        log(f"chown {DAEMON_USER} {path}: {exc}; daemon may fail to read")
+
+
+def systemctl(action: str, unit: str) -> int:
+    return subprocess.run(
+        ["systemctl", action, unit],
+        check=False,
+    ).returncode
+
+
+def domain_socket_from_config(domain: str) -> Path:
+    """Default convention: /run/vhost-user-wg/<domain>.sock."""
+    return RUNTIME_DIR / f"{domain}.sock"
+
+
+def handle_prepare(domain: str) -> int:
+    xml_text = sys.stdin.read()
+    toml_text = extract_toml(xml_text)
+    if toml_text is None:
+        return 0  # not a vuwg-managed domain
+
+    # /run/vhost-user-wg/ may not exist yet on first VM start after boot
+    # (no service has run yet). Create it ourselves so we can write the
+    # config in before invoking systemctl. systemd's RuntimeDirectory= will
+    # adjust ownership when the service starts.
+    RUNTIME_DIR.mkdir(mode=0o755, exist_ok=True)
+
+    config_path = RUNTIME_DIR / f"{domain}.toml"
+    config_path.write_text(toml_text)
+    config_path.chmod(0o600)
+    chown_to_daemon(config_path)
+    log(f"wrote config to {config_path} ({len(toml_text)} bytes)")
+
+    unit = SERVICE_TEMPLATE.format(domain=domain)
+    rc = systemctl("start", unit)
+    if rc != 0:
+        log(f"systemctl start {unit} failed (rc={rc})")
+        return 1
+
+    sock = domain_socket_from_config(domain)
+    deadline = time.monotonic() + SOCKET_WAIT_SECS
+    while time.monotonic() < deadline:
+        try:
+            if stat.S_ISSOCK(sock.stat().st_mode):
+                chmod_socket_for_qemu(sock)
+                log(f"daemon ready: {unit} listening on {sock}")
+                return 0
+        except FileNotFoundError:
+            pass
+        time.sleep(SOCKET_POLL_INTERVAL)
+
+    log(f"timeout waiting for {sock} after {SOCKET_WAIT_SECS}s")
+    systemctl("stop", unit)
+    return 1
+
+
+def handle_release(domain: str) -> int:
+    unit = SERVICE_TEMPLATE.format(domain=domain)
+    config_path = RUNTIME_DIR / f"{domain}.toml"
+    if not config_path.exists():
+        return 0  # not ours
+    systemctl("stop", unit)
+    try:
+        config_path.unlink()
+    except FileNotFoundError:
+        pass
+    log(f"stopped {unit} and removed {config_path}")
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) < 4:
+        return 0  # libvirt always passes 4+ args; defensive no-op
+
+    domain, event, phase = sys.argv[1], sys.argv[2], sys.argv[3]
+
+    if event == "prepare" and phase == "begin":
+        return handle_prepare(domain)
+    if event == "release" and phase == "end":
+        return handle_release(domain)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
