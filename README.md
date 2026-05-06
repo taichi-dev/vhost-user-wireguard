@@ -6,6 +6,8 @@
 
 Userspace WireGuard vhost-user-net daemon for KVM/QEMU/Cloud-Hypervisor. Each VM gets its own process, its own WireGuard identity, and an embedded DHCPv4 server. The daemon speaks the vhost-user protocol over a Unix socket, so the guest sees a standard virtio-net device with no kernel module required on the host.
 
+**Note: This is a pure vibe coding artifact with little testing, use at your own risk**
+
 ---
 
 ## Features
