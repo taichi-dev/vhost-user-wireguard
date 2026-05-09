@@ -219,7 +219,36 @@ impl WgEngine {
         let peer_idx = match self.identify_peer(datagram) {
             Some(idx) => idx,
             None => {
-                tracing::trace!(bytes = n, "wg_unknown_peer_for_datagram");
+                // Decode just enough of the datagram for the operator log so they
+                // can tell scan/noise (random msg_type) from a real peer mismatch
+                // (msg_type 2/3/4 with a receiver_idx outside our peer slot range).
+                let msg_type = if n >= 4 {
+                    u32::from_le_bytes([datagram[0], datagram[1], datagram[2], datagram[3]])
+                } else {
+                    u32::MAX
+                };
+                let receiver_idx = match (msg_type, n) {
+                    (2, x) if x >= 12 => Some(u32::from_le_bytes([
+                        datagram[8],
+                        datagram[9],
+                        datagram[10],
+                        datagram[11],
+                    ])),
+                    (3, x) | (4, x) if x >= 8 => Some(u32::from_le_bytes([
+                        datagram[4],
+                        datagram[5],
+                        datagram[6],
+                        datagram[7],
+                    ])),
+                    _ => None,
+                };
+                tracing::trace!(
+                    bytes = n,
+                    %src_addr,
+                    msg_type,
+                    receiver_idx = ?receiver_idx,
+                    "wg_unknown_peer_for_datagram"
+                );
                 return Ok(SocketPollResult::Consumed);
             }
         };
