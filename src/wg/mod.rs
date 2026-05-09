@@ -24,8 +24,8 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::time::Duration;
 
-use boringtun::noise::TunnResult;
 use boringtun::noise::rate_limiter::RateLimiter;
+use boringtun::noise::{Packet, Tunn, TunnResult};
 use vmm_sys_util::timerfd::TimerFd;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -219,28 +219,12 @@ impl WgEngine {
         let peer_idx = match self.identify_peer(datagram) {
             Some(idx) => idx,
             None => {
-                // Decode just enough of the datagram for the operator log so they
-                // can tell scan/noise (random msg_type) from a real peer mismatch
-                // (msg_type 2/3/4 with a receiver_idx outside our peer slot range).
-                let msg_type = if n >= 4 {
-                    u32::from_le_bytes([datagram[0], datagram[1], datagram[2], datagram[3]])
-                } else {
-                    u32::MAX
-                };
-                let receiver_idx = match (msg_type, n) {
-                    (2, x) if x >= 12 => Some(u32::from_le_bytes([
-                        datagram[8],
-                        datagram[9],
-                        datagram[10],
-                        datagram[11],
-                    ])),
-                    (3, x) | (4, x) if x >= 8 => Some(u32::from_le_bytes([
-                        datagram[4],
-                        datagram[5],
-                        datagram[6],
-                        datagram[7],
-                    ])),
-                    _ => None,
+                let (msg_type, receiver_idx) = match Tunn::parse_incoming_packet(datagram) {
+                    Ok(Packet::HandshakeInit(_)) => ("HandshakeInit", None),
+                    Ok(Packet::HandshakeResponse(p)) => ("HandshakeResponse", Some(p.receiver_idx)),
+                    Ok(Packet::PacketCookieReply(p)) => ("CookieReply", Some(p.receiver_idx)),
+                    Ok(Packet::PacketData(p)) => ("PacketData", Some(p.receiver_idx)),
+                    Err(_) => ("invalid", None),
                 };
                 tracing::trace!(
                     bytes = n,
@@ -288,56 +272,27 @@ impl WgEngine {
         }
     }
 
-    /// Identify which peer a datagram is destined for.
-    ///
-    /// boringtun encodes `peer_idx` in the upper 24 bits of the local index it
-    /// hands out (`local_idx = peer_idx << 8 | session_bits`), so messages
-    /// that carry a receiver index can cheaply derive the peer slot from it.
-    ///
-    /// The receiver index is not at a single offset for all message types:
-    /// handshake responses carry `sender_idx` first and `receiver_idx` at
-    /// bytes 8..12, while data packets and cookie replies carry
-    /// `receiver_idx` at bytes 4..8. Reading bytes 8..12 for data packets
-    /// reads the packet counter; low-throughput traffic then appears to work
-    /// until the counter reaches 256 and the shifted value no longer resolves
-    /// to peer 0.
+    /// boringtun encodes `peer_idx` in the upper 24 bits of the local index
+    /// (`local_idx = peer_idx << 8 | session_bits`), so when an exact lookup
+    /// in `recv_idx_to_peer` misses we can cheaply derive the slot via `>> 8`.
+    /// HandshakeInit carries no receiver index; we fall through to the
+    /// single-peer fast path (multi-peer dispatch would parse the static
+    /// pubkey field, deferred).
     fn identify_peer(&self, datagram: &[u8]) -> Option<usize> {
-        if datagram.len() < 4 {
-            return None;
-        }
-        let msg_type = u32::from_le_bytes([datagram[0], datagram[1], datagram[2], datagram[3]]);
-
-        if msg_type == 1 {
-            // HandshakeInit: no receiver_idx. Single-peer fast path.
-            if self.peers.len() == 1 {
-                return Some(0);
+        let receiver_idx = match Tunn::parse_incoming_packet(datagram).ok()? {
+            Packet::HandshakeInit(_) => {
+                return (self.peers.len() == 1).then_some(0);
             }
-            // Multi-peer: best-effort fall-through to None (the datagram is
-            // effectively dropped). A future revision can extend this with a
-            // parse_handshake_anon-driven match against each peer's public key.
-            return None;
-        }
-
-        let receiver_idx = match msg_type {
-            // HandshakeResponse: type || sender_idx || receiver_idx || ...
-            2 if datagram.len() >= 12 => {
-                u32::from_le_bytes([datagram[8], datagram[9], datagram[10], datagram[11]])
-            }
-            // CookieReply and PacketData: type || receiver_idx || ...
-            3 | 4 if datagram.len() >= 8 => {
-                u32::from_le_bytes([datagram[4], datagram[5], datagram[6], datagram[7]])
-            }
-            _ => return None,
+            Packet::HandshakeResponse(p) => p.receiver_idx,
+            Packet::PacketCookieReply(p) => p.receiver_idx,
+            Packet::PacketData(p) => p.receiver_idx,
         };
         if let Some(&idx) = self.recv_idx_to_peer.get(&receiver_idx) {
             return Some(idx);
         }
         // SAFETY: receiver_idx >> 8 is at most u32::MAX >> 8 = 16_777_215, fits in usize on all supported platforms
         let hint = (receiver_idx >> 8) as usize;
-        if hint < self.peers.len() {
-            return Some(hint);
-        }
-        None
+        (hint < self.peers.len()).then_some(hint)
     }
 
     /// Tick all peer timers. Caller must invoke when the timer fd is readable.

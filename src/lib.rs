@@ -15,7 +15,6 @@ pub mod dhcp;
 pub mod error;
 pub mod ops;
 pub mod wg;
-pub mod wire;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

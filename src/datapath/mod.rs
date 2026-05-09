@@ -57,14 +57,10 @@ use crate::datapath::vring::{Counters, RxProcessor, TxProcessor};
 use crate::dhcp::DhcpServer;
 use crate::error::{Error, VhostError};
 use crate::wg::{RxIpPacket, WgEngine};
-use crate::wire::eth::build_eth_frame;
+use etherparse::EtherType;
 
 /// VIRTIO_F_VERSION_1: feature bit 32, marks the device as 1.0-compliant.
 const VIRTIO_F_VERSION_1_BIT: u32 = 32;
-
-/// EtherType for IPv4. Used when wrapping decapsulated packets back into
-/// Ethernet frames for delivery to the guest.
-const ETHERTYPE_IPV4: u16 = 0x0800;
 
 /// Number of virtqueues we expose: one RX, one TX. We do NOT advertise MQ.
 const NUM_QUEUES: u16 = 2;
@@ -336,7 +332,11 @@ impl WgNetBackend {
         let rx_max = self.rx_max_queue;
         let rx_queue = &mut self.rx_queue;
         let result = self.wg.handle_socket_burst(max_packets, |pkt: RxIpPacket| {
-            let frame = build_eth_frame(vm_mac, gw_mac, ETHERTYPE_IPV4, &pkt.packet);
+            let mut frame = Vec::with_capacity(14 + pkt.packet.len());
+            frame.extend_from_slice(&vm_mac);
+            frame.extend_from_slice(&gw_mac);
+            frame.extend_from_slice(&EtherType::IPV4.0.to_be_bytes());
+            frame.extend_from_slice(&pkt.packet);
             if rx_queue.len() >= rx_max {
                 rx_queue.pop_front();
             }

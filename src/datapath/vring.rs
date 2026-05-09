@@ -38,6 +38,7 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use etherparse::Ipv4Slice;
 use vhost_user_backend::{VringRwLock, VringT};
 use virtio_queue::{DescriptorChain, Error as VirtioQueueError, QueueOwnedT, QueueT};
 use vm_memory::{Bytes, GuestAddress, GuestMemory};
@@ -51,10 +52,6 @@ use crate::wg::routing::AllowedIpsRouter;
 
 /// Length of the `virtio_net_hdr_v1` that prefixes every vring frame.
 const VNET_HDR_LEN: usize = 12;
-/// Byte offset of the IPv4 destination address inside an IPv4 header.
-const IPV4_DST_OFFSET: usize = 16;
-/// Length of an IPv4 address in bytes.
-const IPV4_ADDR_LEN: usize = 4;
 /// Hard cap on descriptor chains we'll consume for a single RX frame under
 /// `VIRTIO_NET_F_MRG_RXBUF`. With a 1500-byte Ethernet payload and reasonable
 /// guest buffer sizing (e.g. 256B/chain) we'd never approach this; hitting it
@@ -462,16 +459,13 @@ impl<'r, 'a, M: GuestMemory> TxProcessor<'r, 'a, M> {
                 peer_idx: _,
                 ip_packet,
             } => {
-                if ip_packet.len() < IPV4_DST_OFFSET + IPV4_ADDR_LEN {
-                    self.counters.inc_drop(&DropReason::BadIpv4Header);
-                    return;
-                }
-                let dst_ip = Ipv4Addr::new(
-                    ip_packet[IPV4_DST_OFFSET],
-                    ip_packet[IPV4_DST_OFFSET + 1],
-                    ip_packet[IPV4_DST_OFFSET + 2],
-                    ip_packet[IPV4_DST_OFFSET + 3],
-                );
+                let dst_ip = match Ipv4Slice::from_slice(&ip_packet) {
+                    Ok(ip) => ip.header().destination_addr(),
+                    Err(_) => {
+                        self.counters.inc_drop(&DropReason::BadIpv4Header);
+                        return;
+                    }
+                };
                 match self.wg.handle_tx_ip_packet(dst_ip, &ip_packet) {
                     Ok(()) => {
                         self.counters.tx_frames.fetch_add(1, Ordering::Relaxed);
@@ -498,9 +492,24 @@ mod tests {
     use vm_memory::{GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryMmap};
     use x25519_dalek::StaticSecret;
 
+    use etherparse::EtherType;
+
     use super::*;
     use crate::config::{Dhcp, DhcpPool, Network, Vm, Wireguard};
-    use crate::wire::eth::build_eth_frame;
+
+    fn build_eth_frame(
+        dst: [u8; 6],
+        src: [u8; 6],
+        ether_type: EtherType,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(14 + payload.len());
+        frame.extend_from_slice(&dst);
+        frame.extend_from_slice(&src);
+        frame.extend_from_slice(&ether_type.0.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
 
     const VM_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
     const GW_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
@@ -842,7 +851,7 @@ mod tests {
             // 12-byte vnet header (all zeros).
             mem.write_slice(&[0u8; 12], GuestAddress(buf_addr)).unwrap();
             // 14-byte Ethernet header: dst=ff:..., src=VM_MAC, ethertype=0x86DD.
-            let eth = build_eth_frame([0xff; 6], VM_MAC, 0x86DD, &[0u8; 6]);
+            let eth = build_eth_frame([0xff; 6], VM_MAC, EtherType::IPV6, &[0u8; 6]);
             mem.write_slice(&eth, GuestAddress(buf_addr + 12)).unwrap();
             write_desc(mem, chain_idx, buf_addr, FRAME_SIZE, 0, 0);
             publish_avail(mem, chain_idx, chain_idx, chain_idx + 1);

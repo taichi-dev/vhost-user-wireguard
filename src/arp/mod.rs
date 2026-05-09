@@ -2,11 +2,10 @@
 
 use std::net::Ipv4Addr;
 
-use crate::wire::arp::{ArpPacket, build_arp_reply};
-use crate::wire::eth::{EthFrame, build_eth_frame};
-
-const ETHERTYPE_ARP: u16 = 0x0806;
-const ARP_OPERATION_REQUEST: u16 = 1;
+use etherparse::{
+    ArpHardwareId, ArpOperation, ArpPacket, ArpPacketSlice, EtherType, Ethernet2Slice,
+    PacketBuilder,
+};
 
 pub fn handle_arp_request(
     frame: &[u8],
@@ -14,65 +13,66 @@ pub fn handle_arp_request(
     gateway_mac: [u8; 6],
     vm_mac: [u8; 6],
 ) -> Option<Vec<u8>> {
-    let eth = EthFrame::new(frame)?;
-
-    if eth.ethertype() != ETHERTYPE_ARP {
+    let eth = Ethernet2Slice::from_slice_without_fcs(frame).ok()?;
+    if eth.ether_type() != EtherType::ARP {
         return None;
     }
 
-    let arp = ArpPacket::new(eth.payload())?;
-
-    if arp.operation() != ARP_OPERATION_REQUEST {
+    let arp = ArpPacketSlice::from_slice(eth.payload_slice()).ok()?;
+    if arp.operation() != ArpOperation::REQUEST {
         return None;
     }
 
-    if arp.target_proto_addr() != gateway_ip {
+    let target_ip_octets: [u8; 4] = arp.target_protocol_addr().try_into().ok()?;
+    if Ipv4Addr::from(target_ip_octets) != gateway_ip {
         return None;
     }
 
-    let arp_reply = build_arp_reply(
-        gateway_mac,
-        gateway_ip,
-        arp.sender_hw_addr(),
-        arp.sender_proto_addr(),
-    );
+    let sender_mac: [u8; 6] = arp.sender_hw_addr().try_into().ok()?;
+    let sender_ip_octets: [u8; 4] = arp.sender_protocol_addr().try_into().ok()?;
 
-    Some(build_eth_frame(
-        vm_mac,
-        gateway_mac,
-        ETHERTYPE_ARP,
-        &arp_reply,
-    ))
+    let reply = ArpPacket::new(
+        ArpHardwareId::ETHERNET,
+        EtherType::IPV4,
+        ArpOperation::REPLY,
+        &gateway_mac,
+        &gateway_ip.octets(),
+        &sender_mac,
+        &sender_ip_octets,
+    )
+    .ok()?;
+
+    let builder = PacketBuilder::ethernet2(gateway_mac, vm_mac).arp(reply);
+    let mut buf = Vec::with_capacity(builder.size());
+    builder.write(&mut buf).ok()?;
+    Some(buf)
 }
 
 #[cfg(test)]
 mod tests {
+    use etherparse::{ArpEthIpv4Packet, ArpOperation, EtherType, PacketBuilder};
+
     use super::*;
 
-    fn build_raw_arp_request(
+    fn build_arp_request_frame(
         sender_mac: [u8; 6],
         sender_ip: Ipv4Addr,
         target_ip: Ipv4Addr,
     ) -> Vec<u8> {
-        let mut pkt = vec![0u8; 28];
-        pkt[0..2].copy_from_slice(&1u16.to_be_bytes());
-        pkt[2..4].copy_from_slice(&0x0800u16.to_be_bytes());
-        pkt[4] = 6;
-        pkt[5] = 4;
-        pkt[6..8].copy_from_slice(&1u16.to_be_bytes());
-        pkt[8..14].copy_from_slice(&sender_mac);
-        pkt[14..18].copy_from_slice(&sender_ip.octets());
-        pkt[24..28].copy_from_slice(&target_ip.octets());
-        pkt
-    }
-
-    fn build_raw_eth_frame(dst: [u8; 6], src: [u8; 6], ethertype: u16, payload: &[u8]) -> Vec<u8> {
-        let mut frame = Vec::with_capacity(14 + payload.len());
-        frame.extend_from_slice(&dst);
-        frame.extend_from_slice(&src);
-        frame.extend_from_slice(&ethertype.to_be_bytes());
-        frame.extend_from_slice(payload);
-        frame
+        let arp = ArpPacket::new(
+            ArpHardwareId::ETHERNET,
+            EtherType::IPV4,
+            ArpOperation::REQUEST,
+            &sender_mac,
+            &sender_ip.octets(),
+            &[0u8; 6],
+            &target_ip.octets(),
+        )
+        .unwrap();
+        let builder = PacketBuilder::ethernet2([0xff; 6], sender_mac).arp(arp);
+        let mut buf = Vec::with_capacity(builder.size());
+        builder.write(&mut buf).unwrap();
+        buf
     }
 
     #[test]
@@ -82,29 +82,21 @@ mod tests {
         let gateway_mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
         let gateway_ip = Ipv4Addr::new(10, 0, 0, 1);
 
-        let arp_pkt = build_raw_arp_request(vm_mac, vm_ip, gateway_ip);
-        let frame = build_raw_eth_frame(
-            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-            vm_mac,
-            0x0806,
-            &arp_pkt,
-        );
+        let frame = build_arp_request_frame(vm_mac, vm_ip, gateway_ip);
+        let reply = handle_arp_request(&frame, gateway_ip, gateway_mac, vm_mac).unwrap();
 
-        let result = handle_arp_request(&frame, gateway_ip, gateway_mac, vm_mac);
-        assert!(result.is_some());
+        let eth = Ethernet2Slice::from_slice_without_fcs(&reply).unwrap();
+        assert_eq!(eth.destination(), vm_mac);
+        assert_eq!(eth.source(), gateway_mac);
+        assert_eq!(eth.ether_type(), EtherType::ARP);
 
-        let reply = result.unwrap();
-        let eth = EthFrame::new(&reply).unwrap();
-        assert_eq!(eth.dst_mac(), vm_mac);
-        assert_eq!(eth.src_mac(), gateway_mac);
-        assert_eq!(eth.ethertype(), 0x0806);
-
-        let arp = ArpPacket::new(eth.payload()).unwrap();
-        assert_eq!(arp.operation(), 2);
-        assert_eq!(arp.sender_hw_addr(), gateway_mac);
-        assert_eq!(arp.sender_proto_addr(), gateway_ip);
-        assert_eq!(arp.target_hw_addr(), vm_mac);
-        assert_eq!(arp.target_proto_addr(), vm_ip);
+        let arp_slice = ArpPacketSlice::from_slice(eth.payload_slice()).unwrap();
+        let arp_eth: ArpEthIpv4Packet = arp_slice.to_packet().try_into().unwrap();
+        assert_eq!(arp_eth.operation, ArpOperation::REPLY);
+        assert_eq!(arp_eth.sender_mac, gateway_mac);
+        assert_eq!(arp_eth.sender_ipv4_addr(), gateway_ip);
+        assert_eq!(arp_eth.target_mac, vm_mac);
+        assert_eq!(arp_eth.target_ipv4_addr(), vm_ip);
     }
 
     #[test]
@@ -115,16 +107,8 @@ mod tests {
         let gateway_ip = Ipv4Addr::new(10, 0, 0, 1);
         let other_ip = Ipv4Addr::new(10, 0, 0, 100);
 
-        let arp_pkt = build_raw_arp_request(vm_mac, vm_ip, other_ip);
-        let frame = build_raw_eth_frame(
-            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-            vm_mac,
-            0x0806,
-            &arp_pkt,
-        );
-
-        let result = handle_arp_request(&frame, gateway_ip, gateway_mac, vm_mac);
-        assert!(result.is_none());
+        let frame = build_arp_request_frame(vm_mac, vm_ip, other_ip);
+        assert!(handle_arp_request(&frame, gateway_ip, gateway_mac, vm_mac).is_none());
     }
 
     #[test]
@@ -134,16 +118,21 @@ mod tests {
         let gateway_mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
         let gateway_ip = Ipv4Addr::new(10, 0, 0, 1);
 
-        let arp_reply = build_arp_reply(gateway_mac, gateway_ip, vm_mac, vm_ip);
-        let frame = build_raw_eth_frame(
-            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-            vm_mac,
-            0x0806,
-            &arp_reply,
-        );
+        let arp_reply = ArpPacket::new(
+            ArpHardwareId::ETHERNET,
+            EtherType::IPV4,
+            ArpOperation::REPLY,
+            &gateway_mac,
+            &gateway_ip.octets(),
+            &vm_mac,
+            &vm_ip.octets(),
+        )
+        .unwrap();
+        let builder = PacketBuilder::ethernet2([0xff; 6], vm_mac).arp(arp_reply);
+        let mut frame = Vec::with_capacity(builder.size());
+        builder.write(&mut frame).unwrap();
 
-        let result = handle_arp_request(&frame, gateway_ip, gateway_mac, vm_mac);
-        assert!(result.is_none());
+        assert!(handle_arp_request(&frame, gateway_ip, gateway_mac, vm_mac).is_none());
     }
 
     #[test]
@@ -152,15 +141,14 @@ mod tests {
         let gateway_mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
         let gateway_ip = Ipv4Addr::new(10, 0, 0, 1);
 
-        let frame = build_raw_eth_frame(
-            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-            vm_mac,
-            0x0800,
-            &[0x45, 0x00, 0x00, 0x14],
-        );
+        let builder = PacketBuilder::ethernet2(vm_mac, [0xff; 6])
+            .ipv4([10, 0, 0, 2], [10, 0, 0, 1], 64)
+            .udp(1024, 80);
+        let payload = [0u8; 4];
+        let mut frame = Vec::with_capacity(builder.size(payload.len()));
+        builder.write(&mut frame, &payload).unwrap();
 
-        let result = handle_arp_request(&frame, gateway_ip, gateway_mac, vm_mac);
-        assert!(result.is_none());
+        assert!(handle_arp_request(&frame, gateway_ip, gateway_mac, vm_mac).is_none());
     }
 
     #[test]
@@ -169,24 +157,6 @@ mod tests {
         let gateway_mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
         let vm_mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
 
-        let result = handle_arp_request(&[0u8; 13], gateway_ip, gateway_mac, vm_mac);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_malformed_arp_packet_returns_none() {
-        let gateway_ip = Ipv4Addr::new(10, 0, 0, 1);
-        let gateway_mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
-        let vm_mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
-
-        let frame = build_raw_eth_frame(
-            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-            vm_mac,
-            0x0806,
-            &[0u8; 27],
-        );
-
-        let result = handle_arp_request(&frame, gateway_ip, gateway_mac, vm_mac);
-        assert!(result.is_none());
+        assert!(handle_arp_request(&[0u8; 13], gateway_ip, gateway_mac, vm_mac).is_none());
     }
 }

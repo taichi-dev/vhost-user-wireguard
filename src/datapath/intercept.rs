@@ -12,22 +12,18 @@
 use std::net::Ipv4Addr;
 use std::time::SystemTime;
 
+use etherparse::icmpv4::DestUnreachableHeader;
+use etherparse::{
+    EtherType, Ethernet2Slice, Icmpv4Type, IpNumber, Ipv4Slice, PacketBuilder, UdpSlice,
+};
+
 use crate::arp::handle_arp_request;
 use crate::dhcp::DhcpServer;
 use crate::wg::routing::AllowedIpsRouter;
-use crate::wire::eth::{EthFrame, build_eth_frame};
-use crate::wire::icmp::build_icmp_frag_needed;
-use crate::wire::ipv4::Ipv4Packet;
-use crate::wire::udp::UdpPacket;
 
-const ETHERTYPE_IPV4: u16 = 0x0800;
-const ETHERTYPE_ARP: u16 = 0x0806;
-const ETHERTYPE_VLAN: u16 = 0x8100;
-const IPPROTO_UDP: u8 = 17;
 const DHCP_SERVER_PORT: u16 = 67;
 const ETH_HEADER_LEN: usize = 14;
-const IPV4_FLAGS_MF: u16 = 0x2000;
-const IPV4_FRAG_OFFSET_MASK: u16 = 0x1FFF;
+const ICMP_FRAG_NEEDED_TTL: u8 = 64;
 
 /// Reason a TX frame was dropped by the trust-boundary pipeline.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -93,63 +89,62 @@ pub fn classify(
     }
     let max_frame_len = usize::from(cfg.vm_mtu) + ETH_HEADER_LEN;
     if frame.len() > max_frame_len {
-        let icmp_ipv4 = build_icmp_frag_needed(&frame[ETH_HEADER_LEN..], cfg.vm_mtu, gateway_ip);
-        let icmp_eth = build_eth_frame(cfg.vm_mac, cfg.gateway_mac, ETHERTYPE_IPV4, &icmp_ipv4);
-        return InterceptDecision::IcmpFragNeeded(icmp_eth);
+        return InterceptDecision::IcmpFragNeeded(build_frag_needed_reply(
+            &frame[ETH_HEADER_LEN..],
+            cfg,
+            gateway_ip,
+        ));
     }
 
     // 2. Parse Ethernet header.
-    let eth = match EthFrame::new(frame) {
-        Some(e) => e,
-        None => return InterceptDecision::Drop(DropReason::FrameTooSmall),
+    let eth = match Ethernet2Slice::from_slice_without_fcs(frame) {
+        Ok(e) => e,
+        Err(_) => return InterceptDecision::Drop(DropReason::FrameTooSmall),
     };
 
     // 3. Source MAC anti-spoof. The VM may only emit frames sourced from its
     //    configured MAC.
-    if eth.src_mac() != cfg.vm_mac {
+    if eth.source() != cfg.vm_mac {
         return InterceptDecision::Drop(DropReason::SrcMacSpoofed);
     }
 
     // 4. Ethertype filter (and 5. ARP fast path).
-    let ethertype = eth.ethertype();
+    let ethertype = eth.ether_type();
     match ethertype {
-        ETHERTYPE_IPV4 => {}
-        ETHERTYPE_ARP => {
+        EtherType::IPV4 => {}
+        EtherType::ARP => {
             return match handle_arp_request(frame, cfg.gateway_ip, cfg.gateway_mac, cfg.vm_mac) {
                 Some(reply) => InterceptDecision::ArpReply(reply),
-                None => InterceptDecision::Drop(DropReason::EthTypeFiltered(ETHERTYPE_ARP)),
+                None => InterceptDecision::Drop(DropReason::EthTypeFiltered(EtherType::ARP.0)),
             };
         }
-        ETHERTYPE_VLAN => return InterceptDecision::Drop(DropReason::VlanTagged),
-        other => return InterceptDecision::Drop(DropReason::EthTypeFiltered(other)),
+        EtherType::VLAN_TAGGED_FRAME => return InterceptDecision::Drop(DropReason::VlanTagged),
+        other => return InterceptDecision::Drop(DropReason::EthTypeFiltered(other.0)),
     }
 
     // 6. Parse IPv4.
-    let ip_payload = eth.payload();
-    let ip = match Ipv4Packet::new(ip_payload) {
-        Some(p) => p,
-        None => return InterceptDecision::Drop(DropReason::BadIpv4Header),
+    let ip_payload = eth.payload_slice();
+    let ip = match Ipv4Slice::from_slice(ip_payload) {
+        Ok(p) => p,
+        Err(_) => return InterceptDecision::Drop(DropReason::BadIpv4Header),
     };
 
     // 7. Reject IP fragments. We refuse to forward fragments at the trust
     //    boundary so that downstream code can rely on a single self-contained
     //    IP datagram per call.
-    let flags_frag = u16::from_be_bytes([ip_payload[6], ip_payload[7]]);
-    let mf_set = (flags_frag & IPV4_FLAGS_MF) != 0;
-    let frag_offset = flags_frag & IPV4_FRAG_OFFSET_MASK;
-    if mf_set || frag_offset != 0 {
+    if ip.is_payload_fragmented() {
         return InterceptDecision::Drop(DropReason::FragmentedPacket);
     }
 
     // 8. DHCP fast path. Only takes the path when the inner UDP datagram is
     //    well-formed AND addressed to the BOOTP/DHCP server port.
-    if ip.protocol() == IPPROTO_UDP {
-        if let Some(udp) = UdpPacket::new(ip.payload()) {
-            if udp.dst_port() == DHCP_SERVER_PORT {
+    if ip.header().protocol() == IpNumber::UDP {
+        if let Ok(udp) = UdpSlice::from_slice(ip.payload().payload) {
+            if udp.destination_port() == DHCP_SERVER_PORT {
                 return match dhcp.handle_packet(frame, now) {
                     Ok(Some(reply)) => InterceptDecision::DhcpReply(reply),
                     Ok(None) => {
-                        InterceptDecision::Drop(DropReason::EthTypeFiltered(ETHERTYPE_IPV4))
+                        InterceptDecision::Drop(DropReason::EthTypeFiltered(EtherType::IPV4.0))
                     }
                     Err(_) => InterceptDecision::Drop(DropReason::BadUdpHeader),
                 };
@@ -160,19 +155,52 @@ pub fn classify(
     // 9. Source IP anti-spoof. Allow 0.0.0.0 (used by some boot protocols)
     //    or an exact match against the active DHCP lease; everything else is
     //    rejected.
-    let src_ip = ip.src_ip();
+    let src_ip = ip.header().source_addr();
     if src_ip != Ipv4Addr::UNSPECIFIED && lease != Some(src_ip) {
         return InterceptDecision::Drop(DropReason::SrcIpSpoofed);
     }
 
     // 10. Route lookup against the WireGuard allowed-IPs trie.
-    match route.lookup_v4(ip.dst_ip()) {
+    match route.lookup_v4(ip.header().destination_addr()) {
         Some(peer_idx) => InterceptDecision::Tunnel {
             peer_idx,
             ip_packet: ip_payload.to_vec(),
         },
         None => InterceptDecision::Drop(DropReason::NoRoute),
     }
+}
+
+/// RFC 792: ICMP Destination Unreachable carries the offending IP header
+/// plus the first 8 bytes of its payload (so the original sender can match
+/// the reply against an in-flight 4-tuple).
+fn build_frag_needed_reply(
+    original_ip_packet: &[u8],
+    cfg: &InterceptCfg,
+    gateway_ip: Ipv4Addr,
+) -> Vec<u8> {
+    let orig = match Ipv4Slice::from_slice(original_ip_packet) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    let orig_header = orig.header().slice();
+    let orig_payload_prefix = &orig.payload().payload[..orig.payload().payload.len().min(8)];
+    let mut icmp_data = Vec::with_capacity(orig_header.len() + orig_payload_prefix.len());
+    icmp_data.extend_from_slice(orig_header);
+    icmp_data.extend_from_slice(orig_payload_prefix);
+
+    let dst_ip = orig.header().source();
+    let builder = PacketBuilder::ethernet2(cfg.gateway_mac, cfg.vm_mac)
+        .ipv4(gateway_ip.octets(), dst_ip, ICMP_FRAG_NEEDED_TTL)
+        .icmpv4(Icmpv4Type::DestinationUnreachable(
+            DestUnreachableHeader::FragmentationNeeded {
+                next_hop_mtu: cfg.vm_mtu,
+            },
+        ));
+    let mut buf = Vec::with_capacity(builder.size(icmp_data.len()));
+    builder
+        .write(&mut buf, &icmp_data)
+        .expect("PacketBuilder write to Vec is infallible for in-range payloads");
+    buf
 }
 
 #[cfg(test)]
@@ -227,40 +255,50 @@ mod tests {
     fn build_ipv4(
         src: Ipv4Addr,
         dst: Ipv4Addr,
-        proto: u8,
+        proto: IpNumber,
         body: &[u8],
         mf: bool,
         frag_offset: u16,
     ) -> Vec<u8> {
-        let total_len = u16::try_from(20 + body.len()).unwrap();
-        let mut bytes = Vec::with_capacity(usize::from(total_len));
-        bytes.push(0x45); // version=4, IHL=5
-        bytes.push(0x00);
-        bytes.extend_from_slice(&total_len.to_be_bytes());
-        bytes.extend_from_slice(&[0, 0]); // identification
-        let mf_bits = if mf { IPV4_FLAGS_MF } else { 0 };
-        let flags_frag = mf_bits | (frag_offset & IPV4_FRAG_OFFSET_MASK);
-        bytes.extend_from_slice(&flags_frag.to_be_bytes());
-        bytes.push(64); // TTL
-        bytes.push(proto);
-        bytes.extend_from_slice(&[0, 0]); // header checksum (left zero for tests)
-        bytes.extend_from_slice(&src.octets());
-        bytes.extend_from_slice(&dst.octets());
+        use etherparse::{IpFragOffset, Ipv4Header};
+        let mut header =
+            Ipv4Header::new(body.len() as u16, 64, proto, src.octets(), dst.octets()).unwrap();
+        header.more_fragments = mf;
+        header.fragment_offset = IpFragOffset::try_new(frag_offset).unwrap();
+        let mut bytes = Vec::with_capacity(20 + body.len());
+        header.write(&mut bytes).unwrap();
         bytes.extend_from_slice(body);
         bytes
     }
 
+    fn build_eth_frame(
+        dst_mac: [u8; 6],
+        src_mac: [u8; 6],
+        ether_type: EtherType,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(ETH_HEADER_LEN + payload.len());
+        frame.extend_from_slice(&dst_mac);
+        frame.extend_from_slice(&src_mac);
+        frame.extend_from_slice(&ether_type.0.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
     fn build_arp_request(sender_mac: [u8; 6], sender_ip: Ipv4Addr, target_ip: Ipv4Addr) -> Vec<u8> {
-        let mut arp = vec![0u8; 28];
-        arp[0..2].copy_from_slice(&1u16.to_be_bytes()); // htype = Ethernet
-        arp[2..4].copy_from_slice(&0x0800u16.to_be_bytes()); // ptype = IPv4
-        arp[4] = 6; // hlen
-        arp[5] = 4; // plen
-        arp[6..8].copy_from_slice(&1u16.to_be_bytes()); // op = REQUEST
-        arp[8..14].copy_from_slice(&sender_mac);
-        arp[14..18].copy_from_slice(&sender_ip.octets());
-        arp[24..28].copy_from_slice(&target_ip.octets());
-        arp
+        use etherparse::{ArpHardwareId, ArpOperation, ArpPacket};
+        ArpPacket::new(
+            ArpHardwareId::ETHERNET,
+            EtherType::IPV4,
+            ArpOperation::REQUEST,
+            &sender_mac,
+            &sender_ip.octets(),
+            &[0u8; 6],
+            &target_ip.octets(),
+        )
+        .unwrap()
+        .to_bytes()
+        .to_vec()
     }
 
     fn build_dhcp_discover(vm_mac: [u8; 6]) -> Vec<u8> {
@@ -284,23 +322,16 @@ mod tests {
             dhcp.encode(&mut enc).unwrap();
         }
 
-        let udp_len = u16::try_from(8 + dhcp_buf.len()).unwrap();
-        let mut udp = Vec::with_capacity(usize::from(udp_len));
-        udp.extend_from_slice(&68u16.to_be_bytes()); // src port (client)
-        udp.extend_from_slice(&67u16.to_be_bytes()); // dst port (server)
-        udp.extend_from_slice(&udp_len.to_be_bytes());
-        udp.extend_from_slice(&[0, 0]); // checksum (skipped)
-        udp.extend_from_slice(&dhcp_buf);
-
-        let ipv4 = build_ipv4(
-            Ipv4Addr::UNSPECIFIED,
-            Ipv4Addr::BROADCAST,
-            17,
-            &udp,
-            false,
-            0,
-        );
-        build_eth_frame([0xff; 6], vm_mac, 0x0800, &ipv4)
+        let builder = PacketBuilder::ethernet2(vm_mac, [0xff; 6])
+            .ipv4(
+                Ipv4Addr::UNSPECIFIED.octets(),
+                Ipv4Addr::BROADCAST.octets(),
+                64,
+            )
+            .udp(68, 67);
+        let mut frame = Vec::with_capacity(builder.size(dhcp_buf.len()));
+        builder.write(&mut frame, &dhcp_buf).unwrap();
+        frame
     }
 
     #[test]
@@ -323,12 +354,12 @@ mod tests {
         let route = AllowedIpsRouter::new();
         let dir = TempDir::new().unwrap();
         let mut dhcp = make_dhcp_server(&dir);
-        // 9000-byte frame with a valid IPv4 header so build_icmp_frag_needed
+        // 9000-byte frame with a valid IPv4 header so build_frag_needed_reply
         // has a packet to reflect.
         let body = vec![0u8; 9000 - 14 - 20];
-        let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), 17, &body, false, 0);
-        let frame = build_eth_frame(GW_MAC, VM_MAC, 0x0800, &ipv4);
-        assert!(frame.len() > usize::from(cfg.vm_mtu) + 14);
+        let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), IpNumber::UDP, &body, false, 0);
+        let frame = build_eth_frame(GW_MAC, VM_MAC, EtherType::IPV4, &ipv4);
+        assert!(frame.len() > usize::from(cfg.vm_mtu) + ETH_HEADER_LEN);
         let result = classify(
             &frame,
             &cfg,
@@ -340,12 +371,10 @@ mod tests {
         );
         match result {
             InterceptDecision::IcmpFragNeeded(reply) => {
-                // Must be at least an Ethernet header + IPv4 header + ICMP header.
-                assert!(reply.len() >= 14 + 20 + 8);
-                // Outer Ethernet is addressed to the VM.
-                assert_eq!(&reply[0..6], &VM_MAC);
-                assert_eq!(&reply[6..12], &GW_MAC);
-                assert_eq!(u16::from_be_bytes([reply[12], reply[13]]), 0x0800);
+                let eth = Ethernet2Slice::from_slice_without_fcs(&reply).unwrap();
+                assert_eq!(eth.destination(), VM_MAC);
+                assert_eq!(eth.source(), GW_MAC);
+                assert_eq!(eth.ether_type(), EtherType::IPV4);
             }
             _ => panic!("expected IcmpFragNeeded"),
         }
@@ -357,9 +386,9 @@ mod tests {
         let route = AllowedIpsRouter::new();
         let dir = TempDir::new().unwrap();
         let mut dhcp = make_dhcp_server(&dir);
-        let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), 6, &[0u8; 4], false, 0);
+        let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), IpNumber::TCP, &[0u8; 4], false, 0);
         let wrong_mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01];
-        let frame = build_eth_frame(GW_MAC, wrong_mac, 0x0800, &ipv4);
+        let frame = build_eth_frame(GW_MAC, wrong_mac, EtherType::IPV4, &ipv4);
         let result = classify(
             &frame,
             &cfg,
@@ -381,7 +410,7 @@ mod tests {
         let route = AllowedIpsRouter::new();
         let dir = TempDir::new().unwrap();
         let mut dhcp = make_dhcp_server(&dir);
-        let frame = build_eth_frame([0xff; 6], VM_MAC, 0x86DD, &[0u8; 40]);
+        let frame = build_eth_frame([0xff; 6], VM_MAC, EtherType::IPV6, &[0u8; 40]);
         let result = classify(&frame, &cfg, None, &route, UNIX_EPOCH, &mut dhcp, GW_IP);
         assert!(matches!(
             result,
@@ -395,7 +424,7 @@ mod tests {
         let route = AllowedIpsRouter::new();
         let dir = TempDir::new().unwrap();
         let mut dhcp = make_dhcp_server(&dir);
-        let frame = build_eth_frame([0xff; 6], VM_MAC, 0x8100, &[0u8; 4]);
+        let frame = build_eth_frame([0xff; 6], VM_MAC, EtherType::VLAN_TAGGED_FRAME, &[0u8; 4]);
         let result = classify(&frame, &cfg, None, &route, UNIX_EPOCH, &mut dhcp, GW_IP);
         assert!(matches!(
             result,
@@ -410,7 +439,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut dhcp = make_dhcp_server(&dir);
         let arp = build_arp_request(VM_MAC, VM_IP, GW_IP);
-        let frame = build_eth_frame([0xff; 6], VM_MAC, 0x0806, &arp);
+        let frame = build_eth_frame([0xff; 6], VM_MAC, EtherType::ARP, &arp);
         let result = classify(
             &frame,
             &cfg,
@@ -422,10 +451,10 @@ mod tests {
         );
         match result {
             InterceptDecision::ArpReply(reply) => {
-                assert!(reply.len() >= 14 + 28);
-                assert_eq!(&reply[0..6], &VM_MAC);
-                assert_eq!(&reply[6..12], &GW_MAC);
-                assert_eq!(u16::from_be_bytes([reply[12], reply[13]]), 0x0806);
+                let eth = Ethernet2Slice::from_slice_without_fcs(&reply).unwrap();
+                assert_eq!(eth.destination(), VM_MAC);
+                assert_eq!(eth.source(), GW_MAC);
+                assert_eq!(eth.ether_type(), EtherType::ARP);
             }
             _ => panic!("expected ArpReply"),
         }
@@ -441,9 +470,8 @@ mod tests {
         let result = classify(&frame, &cfg, None, &route, UNIX_EPOCH, &mut dhcp, GW_IP);
         match result {
             InterceptDecision::DhcpReply(reply) => {
-                // Outer Ethernet must carry IPv4.
-                assert!(reply.len() >= 14 + 20 + 8);
-                assert_eq!(u16::from_be_bytes([reply[12], reply[13]]), 0x0800);
+                let eth = Ethernet2Slice::from_slice_without_fcs(&reply).unwrap();
+                assert_eq!(eth.ether_type(), EtherType::IPV4);
             }
             _ => panic!("expected DhcpReply"),
         }
@@ -455,16 +483,16 @@ mod tests {
         let route = AllowedIpsRouter::new();
         let dir = TempDir::new().unwrap();
         let mut dhcp = make_dhcp_server(&dir);
-        // Use TCP (proto=6) to bypass the DHCP fast path entirely.
+        // Use TCP to bypass the DHCP fast path entirely.
         let ipv4 = build_ipv4(
             Ipv4Addr::new(1, 2, 3, 4),
             Ipv4Addr::new(8, 8, 8, 8),
-            6,
+            IpNumber::TCP,
             &[0u8; 4],
             false,
             0,
         );
-        let frame = build_eth_frame(GW_MAC, VM_MAC, 0x0800, &ipv4);
+        let frame = build_eth_frame(GW_MAC, VM_MAC, EtherType::IPV4, &ipv4);
         let result = classify(
             &frame,
             &cfg,
@@ -486,8 +514,8 @@ mod tests {
         let route = AllowedIpsRouter::new();
         let dir = TempDir::new().unwrap();
         let mut dhcp = make_dhcp_server(&dir);
-        let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), 6, &[0u8; 4], false, 0);
-        let frame = build_eth_frame(GW_MAC, VM_MAC, 0x0800, &ipv4);
+        let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), IpNumber::TCP, &[0u8; 4], false, 0);
+        let frame = build_eth_frame(GW_MAC, VM_MAC, EtherType::IPV4, &ipv4);
         let result = classify(
             &frame,
             &cfg,
@@ -511,8 +539,8 @@ mod tests {
         route.insert(net, 42);
         let dir = TempDir::new().unwrap();
         let mut dhcp = make_dhcp_server(&dir);
-        let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), 6, &[0u8; 4], false, 0);
-        let frame = build_eth_frame(GW_MAC, VM_MAC, 0x0800, &ipv4);
+        let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), IpNumber::TCP, &[0u8; 4], false, 0);
+        let frame = build_eth_frame(GW_MAC, VM_MAC, EtherType::IPV4, &ipv4);
         let result = classify(
             &frame,
             &cfg,
@@ -541,8 +569,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut dhcp = make_dhcp_server(&dir);
         // MF flag set => packet is a non-final fragment.
-        let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), 6, &[0u8; 4], true, 0);
-        let frame = build_eth_frame(GW_MAC, VM_MAC, 0x0800, &ipv4);
+        let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), IpNumber::TCP, &[0u8; 4], true, 0);
+        let frame = build_eth_frame(GW_MAC, VM_MAC, EtherType::IPV4, &ipv4);
         let result = classify(
             &frame,
             &cfg,
@@ -564,9 +592,9 @@ mod tests {
         let route = AllowedIpsRouter::new();
         let dir = TempDir::new().unwrap();
         let mut dhcp = make_dhcp_server(&dir);
-        // Version field set to 5 — Ipv4Packet::new will reject it.
+        // Version field set to 5 — Ipv4Slice::from_slice will reject it.
         let bad_ipv4 = vec![0x55; 20];
-        let frame = build_eth_frame(GW_MAC, VM_MAC, 0x0800, &bad_ipv4);
+        let frame = build_eth_frame(GW_MAC, VM_MAC, EtherType::IPV4, &bad_ipv4);
         let result = classify(&frame, &cfg, None, &route, UNIX_EPOCH, &mut dhcp, GW_IP);
         assert!(matches!(
             result,

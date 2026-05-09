@@ -14,24 +14,21 @@ use dhcproto::v4::{
     Decodable, Decoder, DhcpOption, Encodable, Encoder, Flags, HType, Message, MessageType, Opcode,
     OptionCode,
 };
+use etherparse::{EtherType, Ethernet2Slice, IpNumber, Ipv4Slice, PacketBuilder, UdpSlice};
 
 use crate::config::{Dhcp, Network, Vm};
 use crate::dhcp::lease::{LeaseState, LeaseStore};
 use crate::dhcp::options::{DhcpOptionsBuilder, build_inform_response};
 use crate::dhcp::persist::{LeaseFile, LeaseSnapshot};
 use crate::error::DhcpError;
-use crate::wire::eth::{EthFrame, build_eth_frame};
-use crate::wire::ipv4::Ipv4Packet;
-use crate::wire::udp::UdpPacket;
 
 const DEFAULT_LEASE_SECS: u32 = 3600;
 const DEFAULT_RENEWAL_SECS: u32 = DEFAULT_LEASE_SECS / 2;
 const DEFAULT_REBINDING_SECS: u32 = DEFAULT_LEASE_SECS * 7 / 8;
-const ETHERTYPE_IPV4: u16 = 0x0800;
-const IPPROTO_UDP: u8 = 17;
 const DHCP_SERVER_PORT: u16 = 67;
 const DHCP_CLIENT_PORT: u16 = 68;
 const BROADCAST_MAC: [u8; 6] = [0xff; 6];
+const REPLY_TTL: u8 = 64;
 
 /// DHCPv4 server. Handles DISCOVER, REQUEST, DECLINE, RELEASE, INFORM per RFC 2131.
 pub struct DhcpServer {
@@ -92,25 +89,25 @@ impl DhcpServer {
     ) -> Result<Option<Vec<u8>>, DhcpError> {
         self.store.gc(now);
 
-        let eth = match EthFrame::new(eth_in) {
-            Some(e) => e,
-            None => return Ok(None),
+        let eth = match Ethernet2Slice::from_slice_without_fcs(eth_in) {
+            Ok(e) => e,
+            Err(_) => return Ok(None),
         };
-        if eth.ethertype() != ETHERTYPE_IPV4 {
+        if eth.ether_type() != EtherType::IPV4 {
             return Ok(None);
         }
-        let ipv4 = match Ipv4Packet::new(eth.payload()) {
-            Some(p) => p,
-            None => return Ok(None),
+        let ipv4 = match Ipv4Slice::from_slice(eth.payload_slice()) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
         };
-        if ipv4.protocol() != IPPROTO_UDP {
+        if ipv4.header().protocol() != IpNumber::UDP {
             return Ok(None);
         }
-        let udp = match UdpPacket::new(ipv4.payload()) {
-            Some(u) => u,
-            None => return Ok(None),
+        let udp = match UdpSlice::from_slice(ipv4.payload().payload) {
+            Ok(u) => u,
+            Err(_) => return Ok(None),
         };
-        if udp.dst_port() != DHCP_SERVER_PORT {
+        if udp.destination_port() != DHCP_SERVER_PORT {
             return Ok(None);
         }
 
@@ -293,44 +290,14 @@ impl DhcpServer {
             reply.encode(&mut encoder)?;
         }
 
-        let udp_len = match u16::try_from(8 + dhcp_buf.len()) {
-            Ok(v) => v,
-            Err(_) => return Ok(Vec::new()),
-        };
-        let mut udp_bytes = Vec::with_capacity(usize::from(udp_len));
-        udp_bytes.extend_from_slice(&DHCP_SERVER_PORT.to_be_bytes());
-        udp_bytes.extend_from_slice(&DHCP_CLIENT_PORT.to_be_bytes());
-        udp_bytes.extend_from_slice(&udp_len.to_be_bytes());
-        udp_bytes.extend_from_slice(&[0, 0]);
-        udp_bytes.extend_from_slice(&dhcp_buf);
-
-        let total_len = match u16::try_from(20 + udp_bytes.len()) {
-            Ok(v) => v,
-            Err(_) => return Ok(Vec::new()),
-        };
-        let mut ipv4_bytes = Vec::with_capacity(usize::from(total_len));
-        ipv4_bytes.push(0x45);
-        ipv4_bytes.push(0x00);
-        ipv4_bytes.extend_from_slice(&total_len.to_be_bytes());
-        ipv4_bytes.extend_from_slice(&[0, 0]);
-        ipv4_bytes.extend_from_slice(&[0, 0]);
-        ipv4_bytes.push(64);
-        ipv4_bytes.push(IPPROTO_UDP);
-        ipv4_bytes.extend_from_slice(&[0, 0]);
-        ipv4_bytes.extend_from_slice(&self.network.gateway.octets());
-        ipv4_bytes.extend_from_slice(&dst_ip.octets());
-
-        let csum = ipv4_checksum(&ipv4_bytes[..20]);
-        ipv4_bytes[10..12].copy_from_slice(&csum.to_be_bytes());
-
-        ipv4_bytes.extend_from_slice(&udp_bytes);
-
-        Ok(build_eth_frame(
-            dst_mac,
-            self.gateway_mac,
-            ETHERTYPE_IPV4,
-            &ipv4_bytes,
-        ))
+        let builder = PacketBuilder::ethernet2(self.gateway_mac, dst_mac)
+            .ipv4(self.network.gateway.octets(), dst_ip.octets(), REPLY_TTL)
+            .udp(DHCP_SERVER_PORT, DHCP_CLIENT_PORT);
+        let mut frame = Vec::with_capacity(builder.size(dhcp_buf.len()));
+        builder
+            .write(&mut frame, &dhcp_buf)
+            .expect("PacketBuilder write to Vec is infallible for in-range payloads");
+        Ok(frame)
     }
 
     fn determine_reply_dst(
@@ -387,25 +354,6 @@ fn prefix_to_mask(prefix_len: u8) -> Ipv4Addr {
         return Ipv4Addr::new(255, 255, 255, 255);
     }
     Ipv4Addr::from(!((1u32 << (32 - prefix_len)) - 1))
-}
-
-// IPv4 header checksum: one's complement sum of 16-bit words (RFC 791).
-fn ipv4_checksum(header: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    let mut i = 0;
-    while i + 1 < header.len() {
-        let word = u16::from_be_bytes([header[i], header[i + 1]]);
-        sum = sum.wrapping_add(u32::from(word));
-        i += 2;
-    }
-    if i < header.len() {
-        sum = sum.wrapping_add(u32::from(header[i]) << 8);
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    let folded = u16::try_from(sum & 0xffff).unwrap_or(0);
-    !folded
 }
 
 fn build_dhcp_reply(
@@ -548,47 +496,29 @@ mod tests {
             dhcp.encode(&mut enc).unwrap();
         }
 
-        let udp_len = u16::try_from(8 + dhcp_buf.len()).unwrap();
-        let mut udp_bytes = Vec::with_capacity(usize::from(udp_len));
-        udp_bytes.extend_from_slice(&DHCP_CLIENT_PORT.to_be_bytes());
-        udp_bytes.extend_from_slice(&DHCP_SERVER_PORT.to_be_bytes());
-        udp_bytes.extend_from_slice(&udp_len.to_be_bytes());
-        udp_bytes.extend_from_slice(&[0, 0]);
-        udp_bytes.extend_from_slice(&dhcp_buf);
-
-        let total_len = u16::try_from(20 + udp_bytes.len()).unwrap();
-        let mut ipv4_bytes = Vec::with_capacity(usize::from(total_len));
-        ipv4_bytes.push(0x45);
-        ipv4_bytes.push(0x00);
-        ipv4_bytes.extend_from_slice(&total_len.to_be_bytes());
-        ipv4_bytes.extend_from_slice(&[0, 0]);
-        ipv4_bytes.extend_from_slice(&[0, 0]);
-        ipv4_bytes.push(64);
-        ipv4_bytes.push(IPPROTO_UDP);
-        ipv4_bytes.extend_from_slice(&[0, 0]);
-        ipv4_bytes.extend_from_slice(&src_ip.octets());
-        ipv4_bytes.extend_from_slice(&dst_ip.octets());
-        let csum = ipv4_checksum(&ipv4_bytes[..20]);
-        ipv4_bytes[10..12].copy_from_slice(&csum.to_be_bytes());
-        ipv4_bytes.extend_from_slice(&udp_bytes);
-
         let dst_mac = if broadcast_flag || dst_ip == Ipv4Addr::BROADCAST {
             BROADCAST_MAC
         } else {
             GW_MAC
         };
-        build_eth_frame(dst_mac, chaddr, ETHERTYPE_IPV4, &ipv4_bytes)
+
+        let builder = PacketBuilder::ethernet2(chaddr, dst_mac)
+            .ipv4(src_ip.octets(), dst_ip.octets(), 64)
+            .udp(DHCP_CLIENT_PORT, DHCP_SERVER_PORT);
+        let mut frame = Vec::with_capacity(builder.size(dhcp_buf.len()));
+        builder.write(&mut frame, &dhcp_buf).unwrap();
+        frame
     }
 
     fn parse_reply(frame: &[u8]) -> (Message, Ipv4Addr, [u8; 6]) {
-        let eth = EthFrame::new(frame).expect("eth");
-        assert_eq!(eth.ethertype(), ETHERTYPE_IPV4);
-        let ipv4 = Ipv4Packet::new(eth.payload()).expect("ipv4");
-        let udp = UdpPacket::new(ipv4.payload()).expect("udp");
-        assert_eq!(udp.dst_port(), DHCP_CLIENT_PORT);
-        assert_eq!(udp.src_port(), DHCP_SERVER_PORT);
+        let eth = Ethernet2Slice::from_slice_without_fcs(frame).expect("eth");
+        assert_eq!(eth.ether_type(), EtherType::IPV4);
+        let ipv4 = Ipv4Slice::from_slice(eth.payload_slice()).expect("ipv4");
+        let udp = UdpSlice::from_slice(ipv4.payload().payload).expect("udp");
+        assert_eq!(udp.destination_port(), DHCP_CLIENT_PORT);
+        assert_eq!(udp.source_port(), DHCP_SERVER_PORT);
         let dhcp = Message::decode(&mut Decoder::new(udp.payload())).expect("dhcp decode");
-        (dhcp, ipv4.dst_ip(), eth.dst_mac())
+        (dhcp, ipv4.header().destination_addr(), eth.destination())
     }
 
     #[test]
