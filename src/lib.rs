@@ -14,8 +14,8 @@ pub mod datapath;
 pub mod dhcp;
 pub mod error;
 pub mod ops;
-pub mod wire;
 pub mod wg;
+pub mod wire;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -100,8 +100,11 @@ pub fn run(cli: CliArgs) -> Result<(), Error> {
     //    success/failure on stdout, not structured logs interleaving.
     if cli.check_config {
         crate::config::validate::validate(&config)?;
-        #[allow(clippy::print_stdout)] // User-facing CLI output for --check-config; intentional stdout write
-        { println!("config OK"); }
+        #[allow(clippy::print_stdout)]
+        // User-facing CLI output for --check-config; intentional stdout write
+        {
+            println!("config OK");
+        }
         return Ok(());
     }
 
@@ -183,6 +186,7 @@ pub fn run(cli: CliArgs) -> Result<(), Error> {
         config.vm.ip,
         config.vhost_user.queue_size,
         checkpoint_interval,
+        config.busy_poll.clone(),
     )?;
     let backend = Arc::new(Mutex::new(backend));
 
@@ -208,15 +212,10 @@ pub fn run(cli: CliArgs) -> Result<(), Error> {
     //     the frontend populates it via SET_MEM_TABLE during negotiation.
     let mem = GuestMemoryAtomic::new(GuestMemoryMmap::<()>::new());
     let socket_path = config.vhost_user.socket.clone();
-    let daemon = VhostUserDaemon::new(
-        DAEMON_NAME.to_string(),
-        Arc::clone(&backend),
-        mem,
-    )
-    .map_err(|e| Error::Vhost(VhostError::Backend(e.to_string())))?;
+    let daemon = VhostUserDaemon::new(DAEMON_NAME.to_string(), Arc::clone(&backend), mem)
+        .map_err(|e| Error::Vhost(VhostError::Backend(e.to_string())))?;
 
-    let serve_result =
-        crate::datapath::run_serve_loop(daemon, Arc::clone(&backend), &socket_path);
+    let serve_result = crate::datapath::run_serve_loop(daemon, Arc::clone(&backend), &socket_path);
 
     // 16. Tear down. notify_stopping is best-effort and swallows errors
     //     internally, so we propagate it without checking. Then poke the
@@ -240,9 +239,7 @@ pub fn run(cli: CliArgs) -> Result<(), Error> {
 ///
 /// The thread exits after a single signal — there is no point looping because
 /// the serve loop will tear down on the first observed shutdown event.
-fn spawn_signal_thread(
-    backend: Arc<Mutex<WgNetBackend>>,
-) -> Result<thread::JoinHandle<()>, Error> {
+fn spawn_signal_thread(backend: Arc<Mutex<WgNetBackend>>) -> Result<thread::JoinHandle<()>, Error> {
     use signal_hook::consts::{SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
 

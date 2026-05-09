@@ -159,3 +159,39 @@ start = "10.42.0.2"
 # Last address handed out dynamically (inclusive).
 # Must be >= start, must not be the broadcast address.
 end = "10.42.0.2"
+
+
+# -----------------------------------------------------------------------------
+# [busy_poll] — Adaptive busy polling for the data path (optional)
+# -----------------------------------------------------------------------------
+#
+# When non-zero, after every event (TX kick, UDP datagram, timer tick) the
+# daemon runs a short busy-poll window across the WireGuard UDP socket and
+# the TX virtqueue, draining bursts in user space instead of round-tripping
+# through epoll. This trades a small amount of idle CPU (the loop exits on
+# the first no-progress pass) for significantly lower per-packet latency
+# under burst traffic.
+#
+# The per-burst UDP packet budget is *adaptive*: it grows toward
+# `max_packets` while bursts saturate the budget and shrinks toward
+# `min_packets` when the socket goes idle. The time budget is static.
+#
+# Set `budget_us = 0` to disable busy polling entirely (event-driven only).
+[busy_poll]
+
+# Microsecond time budget per kick. 0 disables busy polling.
+# Range: 0–1_000_000. Default: 50.
+budget_us = 50
+
+# Initial UDP datagram batch per burst. Must be in
+# [min_packets, max_packets].
+# Default: 8.
+initial_packets = 8
+
+# Lower bound on the adaptive UDP batch.
+# Default: 1.
+min_packets = 1
+
+# Upper bound on the adaptive UDP batch. Range: up to 4096.
+# Default: 64.
+max_packets = 64

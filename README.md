@@ -16,6 +16,7 @@ Userspace WireGuard vhost-user-net daemon for KVM/QEMU/Cloud-Hypervisor. Each VM
 - **Embedded DHCPv4 server** with static MAC reservations, dynamic pool, and JSON lease persistence
 - **Local ARP responder** for the virtual gateway (no ARP traffic escapes to the underlay)
 - **ICMPv4 PMTU generation** (Type 3 Code 4) so path MTU discovery works inside the VM
+- **Adaptive busy polling** of the data path (UDP socket + TX virtqueue) for low-latency burst traffic
 - **Hostile-guest hardening**: ethertype whitelist, MAC/IP anti-spoofing, frame-size enforcement
 - **Capability-dropping privilege model**: starts as root, drops to a dedicated user, then drops all capabilities
 - **systemd-native**: `Type=notify`, watchdog heartbeat, `ProtectSystem=strict`, and more
@@ -164,6 +165,7 @@ Full annotated example: [`examples/example-vm.toml`](examples/example-vm.toml)
 | `[[wireguard.peers]]` | `public_key`, `endpoint`, `allowed_ips` | Repeat section for each peer |
 | `[dhcp]` | `checkpoint_secs`, `reservations` | Leases persisted to JSON |
 | `[dhcp.pool]` | `start`, `end` | Dynamic pool range |
+| `[busy_poll]` | `budget_us`, `initial_packets`, `min_packets`, `max_packets` | Adaptive busy-poll tuning; `budget_us=0` disables |
 
 CLI flags override any TOML value. Run `vhost-user-wireguard --help` for the full list.
 

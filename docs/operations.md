@@ -498,6 +498,30 @@ boringtun is pure userspace. Under sustained throughput, one CPU core will be sa
 
 - A tight loop in the vhost-user serve loop (check for log spam)
 - A misconfigured watchdog causing rapid restarts
+- An overly aggressive `[busy_poll]` configuration (see below)
+
+### Tuning busy polling
+
+After every event the daemon runs a short adaptive busy-poll window: it drains the WireGuard UDP socket and the TX virtqueue in a tight loop until either the time budget elapses or no source has work. This cuts per-packet latency under burst traffic by ~5–10× (no epoll round-trip per datagram) at the cost of a small amount of CPU spent spinning when the loop exits.
+
+Defaults are conservative — `budget_us = 50` (50 μs) with an adaptive UDP batch growing from 8 toward 64 packets per burst. The packet budget doubles when a burst saturates the current budget (sustained traffic) and halves when it comes in under half the budget (idle).
+
+Tuning knobs (in the `[busy_poll]` section of the TOML, all overridable on the CLI as `--busy-poll-*`):
+
+| Field | Default | Effect |
+|-------|---------|--------|
+| `budget_us` | `50` | Per-event time budget. Set to `0` to disable busy polling entirely. Higher = better burst latency, more idle CPU. |
+| `initial_packets` | `8` | Starting per-burst UDP batch size. |
+| `min_packets` | `1` | Lower bound on the adaptive batch. |
+| `max_packets` | `64` | Upper bound on the adaptive batch. Capped at 4096. |
+
+When in doubt:
+
+- **Latency-sensitive workload** (e.g. RPC, gaming): try `budget_us = 100` and `max_packets = 128`.
+- **CPU-sensitive workload** (idle most of the time): set `budget_us = 0` to disable.
+- **Bulk throughput**: defaults are usually fine; the adaptive batch climbs on its own.
+
+The loop exits early on the first no-progress pass, so an idle daemon does NOT burn the full `budget_us` every event — it spins for a few hundred nanoseconds at most when there is no work.
 
 ### "backend_mutex_poisoned" in logs
 

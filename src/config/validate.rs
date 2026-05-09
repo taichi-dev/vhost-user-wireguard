@@ -6,11 +6,13 @@
 //! [`ConfigError::Validation`] error. Every check runs even if earlier ones
 //! fail, so users see the full list of problems on one shot.
 
-use crate::config::Config;
-use crate::error::ConfigError;
-use mac_address::MacAddress;
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
+
+use mac_address::MacAddress;
+
+use crate::config::Config;
+use crate::error::ConfigError;
 
 /// Validate a [`Config`] against semantic rules.
 ///
@@ -22,10 +24,7 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
     // 1. Subnet must be /30
     let prefix = config.network.subnet.netmask();
     if prefix != 30 {
-        issues.push(format!(
-            "network.subnet must be /30 (got /{n})",
-            n = prefix
-        ));
+        issues.push(format!("network.subnet must be /30 (got /{n})", n = prefix));
     }
 
     let net_addr = config.network.subnet.network_address();
@@ -223,6 +222,42 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
         ));
     }
 
+    // 17. busy_poll: budget_us cap and packet-budget ordering
+    let bp = &config.busy_poll;
+    if bp.budget_us > 1_000_000 {
+        issues.push(format!(
+            "busy_poll.budget_us {n} exceeds 1_000_000 (1 s)",
+            n = bp.budget_us,
+        ));
+    }
+    if bp.min_packets == 0 {
+        issues.push("busy_poll.min_packets must be >= 1".to_string());
+    }
+    if bp.max_packets == 0 {
+        issues.push("busy_poll.max_packets must be >= 1".to_string());
+    }
+    if bp.min_packets > bp.max_packets {
+        issues.push(format!(
+            "busy_poll.min_packets {min} must be <= busy_poll.max_packets {max}",
+            min = bp.min_packets,
+            max = bp.max_packets,
+        ));
+    }
+    if bp.initial_packets < bp.min_packets || bp.initial_packets > bp.max_packets {
+        issues.push(format!(
+            "busy_poll.initial_packets {init} must be within [busy_poll.min_packets {min}, busy_poll.max_packets {max}]",
+            init = bp.initial_packets,
+            min = bp.min_packets,
+            max = bp.max_packets,
+        ));
+    }
+    if bp.max_packets > 4096 {
+        issues.push(format!(
+            "busy_poll.max_packets {n} exceeds 4096",
+            n = bp.max_packets,
+        ));
+    }
+
     if issues.is_empty() {
         Ok(())
     } else {
@@ -232,12 +267,15 @@ pub fn validate(config: &Config) -> Result<(), ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use ip_network::Ipv4Network;
+
     use super::*;
     use crate::config::{
-        Config, Dhcp, DhcpPool, DhcpReservation, Network, VhostUser, Vm, WgPeer, Wireguard,
+        BusyPoll, Config, Dhcp, DhcpPool, DhcpReservation, Network, VhostUser, Vm, WgPeer,
+        Wireguard,
     };
-    use ip_network::Ipv4Network;
-    use std::path::PathBuf;
 
     fn ipv4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
         Ipv4Addr::new(a, b, c, d)
@@ -251,14 +289,11 @@ mod tests {
         Config {
             wireguard: Wireguard {
                 private_key_file: None,
-                private_key: Some(
-                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
-                ),
+                private_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
                 listen_port: 51820,
                 peers: vec![WgPeer {
                     name: "peer1".to_string(),
-                    public_key: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA="
-                        .to_string(),
+                    public_key: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA=".to_string(),
                     preshared_key: None,
                     preshared_key_file: None,
                     endpoint: "1.2.3.4:51820".parse().expect("endpoint"),
@@ -290,6 +325,7 @@ mod tests {
                 mac: parse_mac("52:54:00:12:34:56"),
                 ip: ipv4(10, 0, 0, 2),
             },
+            busy_poll: BusyPoll::default(),
         }
     }
 
@@ -317,8 +353,7 @@ mod tests {
     #[test]
     fn test_subnet_not_30_rejected() {
         let mut config = valid_config();
-        config.network.subnet =
-            Ipv4Network::new(ipv4(10, 0, 0, 0), 28).expect("net");
+        config.network.subnet = Ipv4Network::new(ipv4(10, 0, 0, 0), 28).expect("net");
         let issues = unwrap_issues(validate(&config));
         assert_issue_contains(&issues, "network.subnet must be /30 (got /28)");
     }
@@ -327,8 +362,7 @@ mod tests {
     fn test_subnet_29_rejected() {
         // AC-CFG-2
         let mut config = valid_config();
-        config.network.subnet =
-            Ipv4Network::new(ipv4(10, 0, 0, 0), 29).expect("net");
+        config.network.subnet = Ipv4Network::new(ipv4(10, 0, 0, 0), 29).expect("net");
         let issues = unwrap_issues(validate(&config));
         assert_issue_contains(&issues, "network.subnet must be /30 (got /29)");
     }
@@ -337,8 +371,7 @@ mod tests {
     fn test_subnet_31_rejected() {
         // AC-CFG-3
         let mut config = valid_config();
-        config.network.subnet =
-            Ipv4Network::new(ipv4(10, 0, 0, 0), 31).expect("net");
+        config.network.subnet = Ipv4Network::new(ipv4(10, 0, 0, 0), 31).expect("net");
         // gateway 10.0.0.1 happens to be the broadcast in /31; just check the prefix issue
         let issues = unwrap_issues(validate(&config));
         assert_issue_contains(&issues, "network.subnet must be /30 (got /31)");
@@ -484,18 +517,14 @@ mod tests {
             hostname: None,
         });
         let issues = unwrap_issues(validate(&config));
-        assert_issue_contains(
-            &issues,
-            "dhcp.reservation 10.0.0.1 conflicts with gateway",
-        );
+        assert_issue_contains(&issues, "dhcp.reservation 10.0.0.1 conflicts with gateway");
     }
 
     #[test]
     fn test_reservation_duplicate_mac() {
         let mut config = valid_config();
         // Two reservations sharing a MAC. Use a /29 subnet to give us room for two IPs.
-        config.network.subnet =
-            Ipv4Network::new(ipv4(10, 0, 0, 0), 29).expect("net");
+        config.network.subnet = Ipv4Network::new(ipv4(10, 0, 0, 0), 29).expect("net");
         config.dhcp.reservations.push(DhcpReservation {
             mac: parse_mac("52:54:00:aa:bb:cc"),
             ip: ipv4(10, 0, 0, 4),
@@ -517,8 +546,7 @@ mod tests {
     fn test_reservation_duplicate_ip() {
         let mut config = valid_config();
         // Move pool out of the way so we test only the dup-IP path.
-        config.network.subnet =
-            Ipv4Network::new(ipv4(10, 0, 0, 0), 29).expect("net");
+        config.network.subnet = Ipv4Network::new(ipv4(10, 0, 0, 0), 29).expect("net");
         config.dhcp.pool.start = ipv4(10, 0, 0, 2);
         config.dhcp.pool.end = ipv4(10, 0, 0, 2);
         config.dhcp.reservations.push(DhcpReservation {
@@ -599,10 +627,7 @@ mod tests {
             },
         ];
         let issues = unwrap_issues(validate(&config));
-        assert_issue_contains(
-            &issues,
-            "wireguard.peers: duplicate public key CCCCCCCC...",
-        );
+        assert_issue_contains(&issues, "wireguard.peers: duplicate public key CCCCCCCC...");
     }
 
     #[test]
@@ -616,8 +641,7 @@ mod tests {
     #[test]
     fn test_socket_parent_dir_missing() {
         let mut config = valid_config();
-        config.vhost_user.socket =
-            PathBuf::from("/this/does/not/exist/anywhere/foo.sock");
+        config.vhost_user.socket = PathBuf::from("/this/does/not/exist/anywhere/foo.sock");
         let issues = unwrap_issues(validate(&config));
         assert_issue_contains(
             &issues,
@@ -667,11 +691,76 @@ mod tests {
     }
 
     #[test]
+    fn test_busy_poll_default_passes() {
+        let config = valid_config();
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_busy_poll_zero_budget_disabled_is_valid() {
+        let mut config = valid_config();
+        config.busy_poll.budget_us = 0;
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_busy_poll_min_zero_rejected() {
+        let mut config = valid_config();
+        config.busy_poll.min_packets = 0;
+        let issues = unwrap_issues(validate(&config));
+        assert_issue_contains(&issues, "busy_poll.min_packets must be >= 1");
+    }
+
+    #[test]
+    fn test_busy_poll_min_above_max_rejected() {
+        let mut config = valid_config();
+        config.busy_poll.min_packets = 100;
+        config.busy_poll.max_packets = 10;
+        config.busy_poll.initial_packets = 50;
+        let issues = unwrap_issues(validate(&config));
+        assert_issue_contains(
+            &issues,
+            "busy_poll.min_packets 100 must be <= busy_poll.max_packets 10",
+        );
+    }
+
+    #[test]
+    fn test_busy_poll_initial_outside_bounds_rejected() {
+        let mut config = valid_config();
+        config.busy_poll.min_packets = 4;
+        config.busy_poll.max_packets = 16;
+        config.busy_poll.initial_packets = 100;
+        let issues = unwrap_issues(validate(&config));
+        assert_issue_contains(
+            &issues,
+            "busy_poll.initial_packets 100 must be within [busy_poll.min_packets 4, busy_poll.max_packets 16]",
+        );
+    }
+
+    #[test]
+    fn test_busy_poll_max_above_4096_rejected() {
+        let mut config = valid_config();
+        config.busy_poll.max_packets = 8192;
+        let issues = unwrap_issues(validate(&config));
+        assert_issue_contains(&issues, "busy_poll.max_packets 8192 exceeds 4096");
+    }
+
+    #[test]
+    fn test_busy_poll_budget_above_one_second_rejected() {
+        let mut config = valid_config();
+        config.busy_poll.budget_us = 5_000_000;
+        let issues = unwrap_issues(validate(&config));
+        assert_issue_contains(
+            &issues,
+            "busy_poll.budget_us 5000000 exceeds 1_000_000 (1 s)",
+        );
+    }
+
+    #[test]
     fn test_collects_multiple_issues() {
         let mut config = valid_config();
         // Trigger 4 distinct issues at once
-        config.network.subnet =
-            Ipv4Network::new(ipv4(10, 0, 0, 0), 28).expect("net"); // #1
+        config.network.subnet = Ipv4Network::new(ipv4(10, 0, 0, 0), 28).expect("net"); // #1
         config.vm.mtu = 100; // #4
         config.wireguard.listen_port = 0; // #13
         config.vhost_user.num_queues = 8; // #16

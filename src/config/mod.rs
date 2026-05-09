@@ -12,6 +12,8 @@ pub struct Config {
     pub dhcp: Dhcp,
     pub network: Network,
     pub vm: Vm,
+    #[serde(default)]
+    pub busy_poll: BusyPoll,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -81,4 +83,41 @@ pub struct DhcpReservation {
     pub mac: mac_address::MacAddress,
     pub ip: std::net::Ipv4Addr,
     pub hostname: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BusyPoll {
+    #[serde(default = "default_busy_poll_budget_us")]
+    pub budget_us: u32,
+    #[serde(default = "default_busy_poll_initial_packets")]
+    pub initial_packets: u32,
+    #[serde(default = "default_busy_poll_min_packets")]
+    pub min_packets: u32,
+    #[serde(default = "default_busy_poll_max_packets")]
+    pub max_packets: u32,
+}
+
+impl Default for BusyPoll {
+    fn default() -> Self {
+        Self {
+            budget_us: default_busy_poll_budget_us(),
+            initial_packets: default_busy_poll_initial_packets(),
+            min_packets: default_busy_poll_min_packets(),
+            max_packets: default_busy_poll_max_packets(),
+        }
+    }
+}
+
+fn default_busy_poll_budget_us() -> u32 {
+    50
+}
+fn default_busy_poll_initial_packets() -> u32 {
+    8
+}
+fn default_busy_poll_min_packets() -> u32 {
+    1
+}
+fn default_busy_poll_max_packets() -> u32 {
+    64
 }

@@ -50,6 +50,13 @@ pub struct RxIpPacket {
     pub packet: Vec<u8>,
 }
 
+/// Outcome of a single non-blocking poll on the WG UDP socket.
+enum SocketPollResult {
+    Idle,
+    Consumed,
+    Tunnel(RxIpPacket),
+}
+
 /// WireGuard engine: UDP socket + timer + peer dispatch.
 pub struct WgEngine {
     pub socket: UdpSocket,
@@ -156,10 +163,55 @@ impl WgEngine {
     /// Drain one UDP datagram from the socket.
     /// Returns `Ok(None)` on `WouldBlock` or non-actionable result.
     pub fn handle_socket_readable(&mut self) -> Result<Option<RxIpPacket>, WgError> {
+        match self.poll_socket_once()? {
+            SocketPollResult::Idle => Ok(None),
+            SocketPollResult::Consumed => Ok(None),
+            SocketPollResult::Tunnel(pkt) => Ok(Some(pkt)),
+        }
+    }
+
+    /// Drain up to `max_packets` UDP datagrams from the socket without
+    /// blocking. Each datagram that yields a tunnel-bound IPv4 packet is
+    /// passed to `sink`; non-tunnel datagrams (handshakes, cookies, replies
+    /// boringtun consumed internally) still count toward the budget.
+    ///
+    /// Returns the number of datagrams consumed (0 when the socket was idle
+    /// at entry). The loop exits on the first WouldBlock so the caller can
+    /// distinguish "budget exhausted" (returned == max_packets) from
+    /// "socket drained" (returned < max_packets).
+    ///
+    /// Used by the adaptive busy-poll loop in [`crate::datapath`] to amortise
+    /// epoll wake-ups under bursty inbound traffic.
+    pub fn handle_socket_burst<F>(
+        &mut self,
+        max_packets: usize,
+        mut sink: F,
+    ) -> Result<usize, WgError>
+    where
+        F: FnMut(RxIpPacket),
+    {
+        let mut drained = 0usize;
+        while drained < max_packets {
+            match self.poll_socket_once()? {
+                SocketPollResult::Idle => break,
+                SocketPollResult::Consumed => drained += 1,
+                SocketPollResult::Tunnel(pkt) => {
+                    sink(pkt);
+                    drained += 1;
+                }
+            }
+        }
+        Ok(drained)
+    }
+
+    /// Single non-blocking poll of the WG socket. Returns a tri-state so
+    /// callers can distinguish socket-empty from non-tunnel-datagram-consumed
+    /// (which look identical through [`Self::handle_socket_readable`]).
+    fn poll_socket_once(&mut self) -> Result<SocketPollResult, WgError> {
         let mut buf = [0u8; MAX_DATAGRAM];
         let (n, src_addr) = match self.socket.recv_from(&mut buf) {
             Ok(p) => p,
-            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(None),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(SocketPollResult::Idle),
             Err(e) => return Err(WgError::SocketSend(e)),
         };
         let datagram = &buf[..n];
@@ -168,7 +220,7 @@ impl WgEngine {
             Some(idx) => idx,
             None => {
                 tracing::trace!(bytes = n, "wg_unknown_peer_for_datagram");
-                return Ok(None);
+                return Ok(SocketPollResult::Consumed);
             }
         };
 
@@ -181,7 +233,7 @@ impl WgEngine {
                     .send_to(&out[..len], endpoint)
                     .map_err(WgError::SocketSend)?;
                 self.drain_peer(peer_idx, &mut out)?;
-                Ok(None)
+                Ok(SocketPollResult::Consumed)
             }
             DecapResult::WriteToTunnelV4 { src_ip, packet_len } => {
                 if !self.peers[peer_idx].allowed_ip_check(src_ip) {
@@ -190,19 +242,19 @@ impl WgEngine {
                         peer = %self.peers[peer_idx].name,
                         "wg_allowed_ip_violation"
                     );
-                    return Ok(None);
+                    return Ok(SocketPollResult::Consumed);
                 }
                 let packet = out[..packet_len].to_vec();
-                Ok(Some(RxIpPacket {
+                Ok(SocketPollResult::Tunnel(RxIpPacket {
                     peer_idx,
                     src_ip,
                     packet,
                 }))
             }
-            DecapResult::Done => Ok(None),
+            DecapResult::Done => Ok(SocketPollResult::Consumed),
             DecapResult::Err(e) => {
                 tracing::trace!(error = %e, "wg_decapsulate_error");
-                Ok(None)
+                Ok(SocketPollResult::Consumed)
             }
         }
     }
@@ -350,12 +402,13 @@ fn timerfd_err(e: vmm_sys_util::errno::Error) -> WgError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::net::SocketAddr;
+
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
     use ip_network::IpNetwork;
-    use std::net::SocketAddr;
 
+    use super::*;
     use crate::config::{WgPeer, Wireguard};
 
     fn make_secret(byte: u8) -> StaticSecret {
@@ -520,5 +573,76 @@ mod tests {
         datagram[8..12].copy_from_slice(&receiver_idx.to_le_bytes());
 
         assert_eq!(engine.identify_peer(&datagram), Some(0));
+    }
+
+    #[test]
+    fn test_handle_socket_burst_returns_zero_on_idle_socket() {
+        let our_secret = make_secret(17);
+        let cfg = one_peer_cfg();
+        let mut engine = WgEngine::new(&cfg, &our_secret).expect("engine should build");
+        let mut count = 0usize;
+        let drained = engine
+            .handle_socket_burst(64, |_pkt| count += 1)
+            .expect("burst should not error");
+        assert_eq!(drained, 0, "idle socket drains zero datagrams");
+        assert_eq!(count, 0, "sink should not be invoked");
+    }
+
+    #[test]
+    fn test_handle_socket_burst_drains_real_handshake_initiations() {
+        // Send max_packets + extras handshake datagrams from a peer socket
+        // to the engine's WG socket. The burst should consume exactly
+        // max_packets datagrams (none are tunnel-bound, so the sink is
+        // never called, but the count includes Consumed datagrams).
+        use std::net::SocketAddr;
+
+        let our_secret = make_secret(19);
+        let cfg = one_peer_cfg();
+        let mut engine = WgEngine::new(&cfg, &our_secret).expect("engine should build");
+
+        // The engine's socket binds to the OS-assigned port (listen_port=0).
+        let local_addr: SocketAddr = {
+            let fd = engine.socket_fd();
+            // SAFETY: the fd is owned by `engine.socket` and remains valid
+            // for the duration of this getsockname call.
+            let borrowed = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(fd) };
+            let any = rustix::net::getsockname(borrowed).expect("getsockname");
+            match any {
+                rustix::net::SocketAddrAny::V6(v6) => {
+                    SocketAddr::V6(std::net::SocketAddrV6::new(*v6.ip(), v6.port(), 0, 0))
+                }
+                _ => panic!("expected v6 bind"),
+            }
+        };
+        // For dual-stack v6 sockets bound to ::, target IPv4 loopback via the
+        // v4-mapped form so the kernel routes the datagram to our socket.
+        let dst: SocketAddr = format!("[::1]:{}", local_addr.port()).parse().unwrap();
+        let sender = std::net::UdpSocket::bind("[::1]:0").expect("sender bind");
+
+        // Push 5 handshake-init-shaped datagrams (msg_type=1, 148 bytes is
+        // the real on-wire size, but our identify_peer only needs >= 4 bytes
+        // for type and our handle_socket_readable will fall through with
+        // None for unknown peers — they still count as Consumed).
+        let mut datagram = vec![0u8; 148];
+        datagram[0..4].copy_from_slice(&1u32.to_le_bytes());
+        for _ in 0..5 {
+            sender.send_to(&datagram, dst).expect("send");
+        }
+
+        // Give the kernel time to deliver the datagrams to the engine socket.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let mut tunnel_count = 0usize;
+        let drained = engine
+            .handle_socket_burst(3, |_pkt| tunnel_count += 1)
+            .expect("burst");
+        assert_eq!(
+            drained, 3,
+            "should drain exactly the budget (3 of 5 enqueued)"
+        );
+        assert_eq!(tunnel_count, 0, "no tunnel packets from junk handshakes");
+
+        let drained2 = engine.handle_socket_burst(64, |_pkt| {}).expect("burst2");
+        assert_eq!(drained2, 2, "remaining 2 datagrams drained on second call");
     }
 }

@@ -33,11 +33,14 @@ use std::net::Ipv4Addr;
 use std::os::fd::IntoRawFd;
 use std::os::unix::io::RawFd;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
-use vhost_user_backend::{VhostUserBackend, VhostUserBackendMut, VhostUserDaemon, VringEpollHandler, VringRwLock};
+use vhost_user_backend::{
+    VhostUserBackend, VhostUserBackendMut, VhostUserDaemon, VringEpollHandler, VringRwLock,
+};
 use virtio_bindings::bindings::virtio_net::{
     VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_MTU, VIRTIO_NET_F_STATUS,
     VIRTIO_NET_S_LINK_UP,
@@ -48,6 +51,7 @@ use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::event::{EventConsumer, EventNotifier};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
+use crate::config::BusyPoll;
 use crate::datapath::intercept::InterceptCfg;
 use crate::datapath::vring::{Counters, RxProcessor, TxProcessor};
 use crate::dhcp::DhcpServer;
@@ -82,6 +86,52 @@ const EXTRA_TOKEN_TIMER: u16 = NUM_QUEUES + 2;
 /// framework's `exit_event` so that callers can request shutdown without
 /// poking at the daemon's internals.
 const EXTRA_TOKEN_EXIT: u16 = NUM_QUEUES + 3;
+
+/// Adaptive busy-poll state. Tracks the current per-burst UDP packet budget
+/// and adjusts it upward when bursts saturate the budget (sustained inbound
+/// traffic) and downward when bursts come in under half the budget (idle).
+///
+/// The time budget (`budget_us`) is static; the packet budget is the
+/// "adaptive" knob.
+struct BusyPollState {
+    cfg: BusyPoll,
+    current_packets: u32,
+}
+
+impl BusyPollState {
+    fn new(cfg: BusyPoll) -> Self {
+        let current_packets = cfg.initial_packets.clamp(cfg.min_packets, cfg.max_packets);
+        Self {
+            cfg,
+            current_packets,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.cfg.budget_us > 0
+    }
+
+    fn time_budget(&self) -> Duration {
+        Duration::from_micros(u64::from(self.cfg.budget_us))
+    }
+
+    fn packet_budget(&self) -> usize {
+        usize::try_from(self.current_packets).unwrap_or(usize::MAX)
+    }
+
+    /// Adjust the adaptive packet budget after a burst. Doubles when the
+    /// burst saturated the budget (high-throughput regime) and halves when
+    /// the burst was less than half the budget (low-throughput regime).
+    fn observe(&mut self, drained: usize) {
+        let cur = self.current_packets;
+        let drained_u32 = u32::try_from(drained).unwrap_or(u32::MAX);
+        if drained_u32 >= cur {
+            self.current_packets = cur.saturating_mul(2).min(self.cfg.max_packets);
+        } else if drained_u32 < cur.saturating_div(2) {
+            self.current_packets = (cur / 2).max(self.cfg.min_packets);
+        }
+    }
+}
 
 /// vhost-user backend implementing a vhost-user-net device whose datapath is
 /// a userspace WireGuard tunnel.
@@ -118,6 +168,8 @@ pub struct WgNetBackend {
     event_idx: bool,
     /// Soft cap on [`Self::rx_queue`]; older frames are evicted on overflow.
     rx_max_queue: usize,
+    /// Adaptive busy-poll budget tracker.
+    busy_poll: BusyPollState,
 }
 
 impl WgNetBackend {
@@ -134,6 +186,7 @@ impl WgNetBackend {
         vm_ip: Ipv4Addr,
         queue_size: u16,
         checkpoint_interval: Duration,
+        busy_poll_cfg: BusyPoll,
     ) -> Result<Self, VhostError> {
         let exit_eventfd = EventFd::new(EFD_NONBLOCK).map_err(VhostError::EventFd)?;
         Ok(Self {
@@ -150,6 +203,7 @@ impl WgNetBackend {
             queue_size,
             event_idx: false,
             rx_max_queue: DEFAULT_RX_QUEUE_DEPTH,
+            busy_poll: BusyPollState::new(busy_poll_cfg),
         })
     }
 
@@ -215,11 +269,7 @@ impl WgNetBackend {
     /// RX replies, encapsulate any tunnel-bound packets through [`WgEngine`].
     /// After draining TX, also flush any RX frames that the in-band replies
     /// produced so the guest sees them in the same kick window.
-    fn run_tx(
-        &mut self,
-        rx_vring: &VringRwLock,
-        tx_vring: &VringRwLock,
-    ) -> Result<(), VhostError> {
+    fn run_tx(&mut self, rx_vring: &VringRwLock, tx_vring: &VringRwLock) -> Result<(), VhostError> {
         let Some(mem_atomic) = self.memory() else {
             return Ok(());
         };
@@ -269,35 +319,99 @@ impl WgNetBackend {
         Ok(())
     }
 
-    /// Drain one decapsulated IPv4 packet from the WG socket (if any), wrap
-    /// it in an Ethernet frame addressed back to the VM, and push it onto
-    /// the bounded RX queue (oldest-evicted on overflow).
-    fn handle_wg_socket_readable(
-        &mut self,
-        rx_vring: &VringRwLock,
-    ) -> Result<(), VhostError> {
-        match self.wg.handle_socket_readable() {
-            Ok(Some(RxIpPacket {
-                peer_idx: _,
-                src_ip: _,
-                packet,
-            })) => {
-                let frame = build_eth_frame(
-                    self.intercept_cfg.vm_mac,
-                    self.intercept_cfg.gateway_mac,
-                    ETHERTYPE_IPV4,
-                    &packet,
-                );
-                if self.rx_queue.len() >= self.rx_max_queue {
-                    self.rx_queue.pop_front();
-                }
-                self.rx_queue.push_back(frame);
+    /// Drain decapsulated IPv4 packets from the WG socket using the adaptive
+    /// packet budget, wrap each in an Ethernet frame, and push onto the
+    /// bounded RX queue. Returns the number of UDP datagrams consumed (0 if
+    /// the socket was idle).
+    ///
+    /// Every datagram counts toward the return value, including handshake /
+    /// cookie / unknown-peer datagrams that boringtun consumed but produced
+    /// no tunnel-bound packet — the count is what feeds the adaptive budget.
+    fn drain_wg_socket_burst(&mut self, max_packets: usize) -> usize {
+        if max_packets == 0 {
+            return 0;
+        }
+        let vm_mac = self.intercept_cfg.vm_mac;
+        let gw_mac = self.intercept_cfg.gateway_mac;
+        let rx_max = self.rx_max_queue;
+        let rx_queue = &mut self.rx_queue;
+        let result = self.wg.handle_socket_burst(max_packets, |pkt: RxIpPacket| {
+            let frame = build_eth_frame(vm_mac, gw_mac, ETHERTYPE_IPV4, &pkt.packet);
+            if rx_queue.len() >= rx_max {
+                rx_queue.pop_front();
             }
-            Ok(None) => {}
+            rx_queue.push_back(frame);
+        });
+        match result {
+            Ok(n) => n,
             Err(error) => {
-                tracing::trace!(error = %error, "wg_socket_readable_error");
+                tracing::trace!(error = %error, "wg_socket_burst_error");
+                0
             }
         }
+    }
+
+    /// Run a bounded busy-poll window across UDP socket + TX vring + RX
+    /// flush. Exits when the time budget elapses OR a full pass made no
+    /// progress (idle). Adapts the per-burst UDP packet budget based on
+    /// observed throughput.
+    ///
+    /// Each iteration:
+    /// 1. Drain up to `current_packets` UDP datagrams (adjusts the budget
+    ///    afterwards).
+    /// 2. Re-run the TX vring drain loop ([`TxProcessor::process`]) — this
+    ///    is `EVENT_IDX`-correct and idempotent, so calling it again is
+    ///    safe even if the framework has not yet delivered a fresh kick.
+    /// 3. Flush the RX queue into the RX vring.
+    ///
+    /// The loop is a no-op when busy-poll is disabled (`budget_us == 0`)
+    /// or when the frontend has not yet populated guest memory.
+    fn busy_poll_window(
+        &mut self,
+        rx_vring: &VringRwLock,
+        tx_vring: Option<&VringRwLock>,
+    ) -> Result<(), VhostError> {
+        if !self.busy_poll.enabled() || self.memory().is_none() {
+            return Ok(());
+        }
+        let deadline = Instant::now() + self.busy_poll.time_budget();
+        loop {
+            let mut progress = false;
+
+            let budget = self.busy_poll.packet_budget();
+            let drained = self.drain_wg_socket_burst(budget);
+            self.busy_poll.observe(drained);
+            if drained > 0 {
+                progress = true;
+            }
+
+            if let Some(txv) = tx_vring {
+                let pre_tx = self.counters.tx_frames.load(Ordering::Relaxed);
+                self.run_tx(rx_vring, txv)?;
+                let post_tx = self.counters.tx_frames.load(Ordering::Relaxed);
+                if post_tx != pre_tx {
+                    progress = true;
+                }
+            }
+
+            self.flush_rx(rx_vring)?;
+
+            if !progress {
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drain UDP datagrams from the WG socket using the adaptive packet
+    /// budget and flush any new RX frames to the guest.
+    fn handle_wg_socket_readable(&mut self, rx_vring: &VringRwLock) -> Result<(), VhostError> {
+        let budget = self.busy_poll.packet_budget().max(1);
+        let drained = self.drain_wg_socket_burst(budget);
+        self.busy_poll.observe(drained);
         self.flush_rx(rx_vring)?;
         Ok(())
     }
@@ -361,10 +475,7 @@ impl VhostUserBackendMut for WgNetBackend {
         self.event_idx = enabled;
     }
 
-    fn update_memory(
-        &mut self,
-        mem: GuestMemoryAtomic<GuestMemoryMmap>,
-    ) -> IoResult<()> {
+    fn update_memory(&mut self, mem: GuestMemoryAtomic<GuestMemoryMmap>) -> IoResult<()> {
         self.mem = Some(mem);
         Ok(())
     }
@@ -449,41 +560,35 @@ impl VhostUserBackendMut for WgNetBackend {
         };
         let tx_vring_opt = vrings.get(usize::from(TX_QUEUE_EVENT));
 
-        match device_event {
-            RX_QUEUE_EVENT => self
-                .flush_rx(rx_vring)
-                .map_err(|e| io::Error::other(e.to_string())),
+        let primary: Result<(), VhostError> = match device_event {
+            RX_QUEUE_EVENT => self.flush_rx(rx_vring),
             TX_QUEUE_EVENT => {
                 let tx_vring = match tx_vring_opt {
                     Some(v) => v,
                     None => return Ok(()),
                 };
                 self.run_tx(rx_vring, tx_vring)
-                    .map_err(|e| io::Error::other(e.to_string()))
             }
-            EXTRA_TOKEN_UDP => self
-                .handle_wg_socket_readable(rx_vring)
-                .map_err(|e| io::Error::other(e.to_string())),
-            EXTRA_TOKEN_TIMER => {
-                self.handle_timer_tick()
-                    .map_err(|e| io::Error::other(e.to_string()))?;
+            EXTRA_TOKEN_UDP => self.handle_wg_socket_readable(rx_vring),
+            EXTRA_TOKEN_TIMER => self.handle_timer_tick().and_then(|_| {
                 // Timer ticks may have unblocked WG TX (handshake completion);
                 // pump the RX queue in case anything backed up.
                 self.flush_rx(rx_vring)
-                    .map_err(|e| io::Error::other(e.to_string()))
-            }
+            }),
             EXTRA_TOKEN_EXIT => {
                 // Returning Err propagates up through the framework's
                 // VringEpollHandler::run loop and breaks `daemon.serve()`.
-                Err(io::Error::other(
-                    "shutdown requested via EXTRA_TOKEN_EXIT",
-                ))
+                return Err(io::Error::other("shutdown requested via EXTRA_TOKEN_EXIT"));
             }
             other => {
                 tracing::warn!(token = other, "unknown_handle_event_token");
                 Ok(())
             }
-        }
+        };
+        primary.map_err(|e| io::Error::other(e.to_string()))?;
+        self.busy_poll_window(rx_vring, tx_vring_opt)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -551,9 +656,9 @@ pub fn run_serve_loop(
     use vhost::vhost_user::Listener;
 
     let (wg_socket_fd, timer_fd, exit_fd) = {
-        let b = backend.lock().map_err(|_| {
-            Error::Vhost(VhostError::Backend("backend mutex poisoned".to_string()))
-        })?;
+        let b = backend
+            .lock()
+            .map_err(|_| Error::Vhost(VhostError::Backend("backend mutex poisoned".to_string())))?;
         (b.wg_socket_fd(), b.wg_timer_fd(), b.exit_fd())
     };
 
@@ -598,14 +703,13 @@ pub fn run_serve_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use ip_network::Ipv4Network;
     use mac_address::MacAddress;
     use tempfile::TempDir;
     use x25519_dalek::StaticSecret;
 
-    use crate::config::{Dhcp, DhcpPool, Network, Vm, Wireguard};
+    use super::*;
+    use crate::config::{BusyPoll, Dhcp, DhcpPool, Network, Vm, Wireguard};
 
     const VM_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
     const GW_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
@@ -664,6 +768,7 @@ mod tests {
             VM_IP,
             256,
             Duration::from_secs(60),
+            BusyPoll::default(),
         )
         .expect("backend new")
     }
@@ -744,11 +849,8 @@ mod tests {
         let mut backend = make_backend(&dir);
         assert!(backend.mem.is_none(), "fresh backend has no memory");
 
-        let gmm = GuestMemoryMmap::<()>::from_ranges(&[(
-            vm_memory::GuestAddress(0),
-            0x10000,
-        )])
-        .unwrap();
+        let gmm =
+            GuestMemoryMmap::<()>::from_ranges(&[(vm_memory::GuestAddress(0), 0x10000)]).unwrap();
         let atomic = GuestMemoryAtomic::new(gmm);
         backend.update_memory(atomic).expect("update_memory");
 
@@ -816,5 +918,131 @@ mod tests {
         // The exit_event consumer can now consume the pending notification.
         let (consumer, _notifier) = backend.exit_event(0).expect("exit_event");
         consumer.consume().expect("consume after signal_exit");
+    }
+
+    #[test]
+    fn test_busy_poll_state_starts_at_initial_packets() {
+        let cfg = BusyPoll {
+            budget_us: 50,
+            initial_packets: 8,
+            min_packets: 1,
+            max_packets: 64,
+        };
+        let state = BusyPollState::new(cfg);
+        assert_eq!(state.packet_budget(), 8);
+        assert!(state.enabled());
+    }
+
+    #[test]
+    fn test_busy_poll_state_disabled_when_budget_zero() {
+        let cfg = BusyPoll {
+            budget_us: 0,
+            ..BusyPoll::default()
+        };
+        let state = BusyPollState::new(cfg);
+        assert!(!state.enabled());
+    }
+
+    #[test]
+    fn test_busy_poll_state_grows_when_burst_saturates() {
+        let cfg = BusyPoll {
+            budget_us: 50,
+            initial_packets: 8,
+            min_packets: 1,
+            max_packets: 64,
+        };
+        let mut state = BusyPollState::new(cfg);
+
+        state.observe(8);
+        assert_eq!(state.packet_budget(), 16, "saturated burst doubles budget");
+
+        state.observe(16);
+        assert_eq!(state.packet_budget(), 32);
+
+        state.observe(32);
+        assert_eq!(state.packet_budget(), 64);
+
+        state.observe(64);
+        assert_eq!(state.packet_budget(), 64, "growth caps at max_packets");
+    }
+
+    #[test]
+    fn test_busy_poll_state_shrinks_when_burst_idle() {
+        let cfg = BusyPoll {
+            budget_us: 50,
+            initial_packets: 32,
+            min_packets: 1,
+            max_packets: 64,
+        };
+        let mut state = BusyPollState::new(cfg);
+        assert_eq!(state.packet_budget(), 32);
+
+        state.observe(0);
+        assert_eq!(state.packet_budget(), 16, "idle burst halves budget");
+
+        state.observe(0);
+        assert_eq!(state.packet_budget(), 8);
+
+        state.observe(0);
+        assert_eq!(state.packet_budget(), 4);
+
+        state.observe(0);
+        assert_eq!(state.packet_budget(), 2);
+
+        state.observe(0);
+        assert_eq!(state.packet_budget(), 1);
+
+        state.observe(0);
+        assert_eq!(state.packet_budget(), 1, "shrink floors at min_packets");
+    }
+
+    #[test]
+    fn test_busy_poll_state_holds_steady_in_mid_range() {
+        let cfg = BusyPoll {
+            budget_us: 50,
+            initial_packets: 8,
+            min_packets: 1,
+            max_packets: 64,
+        };
+        let mut state = BusyPollState::new(cfg);
+
+        // drained == 5: not saturated (>= 8) AND not below half (< 4).
+        // Expectation: budget unchanged.
+        state.observe(5);
+        assert_eq!(state.packet_budget(), 8);
+
+        state.observe(7);
+        assert_eq!(state.packet_budget(), 8);
+    }
+
+    #[test]
+    fn test_busy_poll_state_clamps_initial_to_bounds() {
+        let cfg = BusyPoll {
+            budget_us: 50,
+            initial_packets: 1000,
+            min_packets: 4,
+            max_packets: 32,
+        };
+        let state = BusyPollState::new(cfg);
+        assert_eq!(state.packet_budget(), 32, "initial above max clamps down");
+
+        let cfg2 = BusyPoll {
+            budget_us: 50,
+            initial_packets: 1,
+            min_packets: 8,
+            max_packets: 32,
+        };
+        let state2 = BusyPollState::new(cfg2);
+        assert_eq!(state2.packet_budget(), 8, "initial below min clamps up");
+    }
+
+    #[test]
+    fn test_busy_poll_state_time_budget_matches_config() {
+        let cfg = BusyPoll {
+            budget_us: 250,
+            ..BusyPoll::default()
+        };
+        let state = BusyPollState::new(cfg);
+        assert_eq!(state.time_budget(), Duration::from_micros(250));
     }
 }

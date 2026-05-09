@@ -2,9 +2,10 @@
 
 //! TOML file loader for [`crate::config::Config`].
 
+use std::path::Path;
+
 use crate::config::Config;
 use crate::error::ConfigError;
-use std::path::Path;
 
 /// Read and parse a TOML configuration file.
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
@@ -18,9 +19,11 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
     use tempfile::NamedTempFile;
+
+    use super::*;
 
     const VALID_TOML: &str = r#"
 [wireguard]

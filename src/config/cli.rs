@@ -77,6 +77,22 @@ pub struct CliArgs {
     /// Log filter (e.g. "info,vhost_user_wireguard=debug")
     #[arg(long)]
     pub log_filter: Option<String>,
+
+    /// Adaptive busy-poll budget in microseconds (0 disables)
+    #[arg(long)]
+    pub busy_poll_budget_us: Option<u32>,
+
+    /// Initial UDP datagram batch per busy-poll burst (adaptive)
+    #[arg(long)]
+    pub busy_poll_initial_packets: Option<u32>,
+
+    /// Lower bound on adaptive UDP datagram batch
+    #[arg(long)]
+    pub busy_poll_min_packets: Option<u32>,
+
+    /// Upper bound on adaptive UDP datagram batch
+    #[arg(long)]
+    pub busy_poll_max_packets: Option<u32>,
 }
 
 /// Merge CLI overrides into a Config, returning the updated Config.
@@ -121,16 +137,29 @@ pub fn apply_overrides(mut config: Config, args: &CliArgs) -> Config {
     if let Some(secs) = args.dhcp_checkpoint_secs {
         config.dhcp.checkpoint_secs = secs;
     }
+    if let Some(v) = args.busy_poll_budget_us {
+        config.busy_poll.budget_us = v;
+    }
+    if let Some(v) = args.busy_poll_initial_packets {
+        config.busy_poll.initial_packets = v;
+    }
+    if let Some(v) = args.busy_poll_min_packets {
+        config.busy_poll.min_packets = v;
+    }
+    if let Some(v) = args.busy_poll_max_packets {
+        config.busy_poll.max_packets = v;
+    }
 
     config
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::{Dhcp, DhcpPool, Network, VhostUser, Vm, Wireguard};
     use std::net::Ipv4Addr;
     use std::path::PathBuf;
+
+    use super::super::{BusyPoll, Dhcp, DhcpPool, Network, VhostUser, Vm, Wireguard};
+    use super::*;
 
     fn make_test_config() -> Config {
         Config {
@@ -164,6 +193,7 @@ mod tests {
                 mac: "52:54:00:12:34:56".parse().unwrap(),
                 ip: Ipv4Addr::new(10, 0, 0, 100),
             },
+            busy_poll: BusyPoll::default(),
         }
     }
 
@@ -178,7 +208,10 @@ mod tests {
         assert_eq!(result.vhost_user.queue_size, config.vhost_user.queue_size);
         assert_eq!(result.network.gateway, config.network.gateway);
         assert_eq!(result.vm.mtu, config.vm.mtu);
-        assert_eq!(result.dhcp.decline_probation_secs, config.dhcp.decline_probation_secs);
+        assert_eq!(
+            result.dhcp.decline_probation_secs,
+            config.dhcp.decline_probation_secs
+        );
     }
 
     #[test]
