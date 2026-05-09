@@ -358,6 +358,12 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
         }
     }
 
+    /// Currently unused: upstream callers that gated on
+    /// `VHOST_USER_F_PROTOCOL_FEATURES` were stripped as a sister edit to the
+    /// `vhost-user-backend` patch in `handler.rs::set_vring_enable`, so QEMU
+    /// 8.2.x's pre-`SET_FEATURES` probe messages are accepted. Retained as a
+    /// breadcrumb to mark the patch site on future upstream resync.
+    #[allow(dead_code)]
     fn check_feature(&self, feat: VhostUserVirtioFeatures) -> Result<()> {
         if self.acked_virtio_features & feat.bits() != 0 {
             Ok(())

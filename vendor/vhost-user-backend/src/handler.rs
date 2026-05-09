@@ -244,7 +244,14 @@ where
         Ok(())
     }
 
-    /// Helper to check if VirtioFeature enabled
+    /// Helper to check if VirtioFeature enabled.
+    ///
+    /// Currently unused: the upstream call sites (notably in `set_vring_enable`
+    /// and other pre-`SET_FEATURES` handlers) were patched out so QEMU 8.2.x's
+    /// probe-phase messages are accepted instead of rejected. See the comment
+    /// in `set_vring_enable` below for the full rationale. Retained as a
+    /// breadcrumb to mark the patch site on future upstream resync.
+    #[allow(dead_code)]
     fn check_feature(&self, feat: VhostUserVirtioFeatures) -> VhostUserResult<()> {
         if self.acked_features & feat.bits() != 0 {
             Ok(())
