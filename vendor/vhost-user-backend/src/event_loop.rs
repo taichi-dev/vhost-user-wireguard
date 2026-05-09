@@ -156,44 +156,77 @@ where
         const EPOLL_EVENTS_LEN: usize = 100;
         let mut events = vec![EpollEvent::new(EventSet::empty(), 0); EPOLL_EVENTS_LEN];
 
-        'epoll: loop {
-            let num_events = match self.epoll.wait(-1, &mut events[..]) {
-                Ok(res) => res,
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::Interrupted {
-                        // It's well defined from the epoll_wait() syscall
-                        // documentation that the epoll loop can be interrupted
-                        // before any of the requested events occurred or the
-                        // timeout expired. In both those cases, epoll_wait()
-                        // returns an error of type EINTR, but this should not
-                        // be considered as a regular error. Instead it is more
-                        // appropriate to retry, by calling into epoll_wait().
-                        continue;
-                    }
-                    return Err(VringEpollError::EpollWait(e));
-                }
-            };
+        log::info!(
+            "vring_epoll_run_enter thread_id={} num_queues={}",
+            self.thread_id,
+            self.backend.num_queues()
+        );
 
-            for event in events.iter().take(num_events) {
-                let evset = match EventSet::from_bits(event.events) {
-                    Some(evset) => evset,
-                    None => {
-                        let evbits = event.events;
-                        println!("epoll: ignoring unknown event set: 0x{evbits:x}");
-                        continue;
+        let result: VringEpollResult<()> = (|| {
+            'epoll: loop {
+                let num_events = match self.epoll.wait(-1, &mut events[..]) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        if e.kind() == io::ErrorKind::Interrupted {
+                            // It's well defined from the epoll_wait() syscall
+                            // documentation that the epoll loop can be interrupted
+                            // before any of the requested events occurred or the
+                            // timeout expired. In both those cases, epoll_wait()
+                            // returns an error of type EINTR, but this should not
+                            // be considered as a regular error. Instead it is more
+                            // appropriate to retry, by calling into epoll_wait().
+                            continue;
+                        }
+                        log::error!(
+                            "vring_epoll_wait_failed thread_id={} err={}",
+                            self.thread_id,
+                            e
+                        );
+                        return Err(VringEpollError::EpollWait(e));
                     }
                 };
 
-                let ev_type = event.data() as u16;
+                for event in events.iter().take(num_events) {
+                    let evset = match EventSet::from_bits(event.events) {
+                        Some(evset) => evset,
+                        None => {
+                            let evbits = event.events;
+                            log::warn!(
+                                "vring_epoll_unknown_event_set thread_id={} bits=0x{:x}",
+                                self.thread_id,
+                                evbits
+                            );
+                            continue;
+                        }
+                    };
 
-                // handle_event() returns true if an event is received from the exit event fd.
-                if self.handle_event(ev_type, evset)? {
-                    break 'epoll;
+                    let ev_type = event.data() as u16;
+
+                    // handle_event() returns true if an event is received from the exit event fd.
+                    match self.handle_event(ev_type, evset) {
+                        Ok(true) => break 'epoll,
+                        Ok(false) => {}
+                        Err(e) => {
+                            log::error!(
+                                "vring_epoll_handle_event_err thread_id={} token={} err={}",
+                                self.thread_id,
+                                ev_type,
+                                e
+                            );
+                            return Err(e);
+                        }
+                    }
                 }
             }
-        }
+            Ok(())
+        })();
 
-        Ok(())
+        log::warn!(
+            "vring_epoll_run_exit thread_id={} ok={}",
+            self.thread_id,
+            result.is_ok()
+        );
+        result
     }
 
     fn handle_event(&self, device_event: u16, evset: EventSet) -> VringEpollResult<bool> {

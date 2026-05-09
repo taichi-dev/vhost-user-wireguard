@@ -546,14 +546,47 @@ impl VhostUserBackendMut for WgNetBackend {
         vrings: &[Self::Vring],
         _thread_id: usize,
     ) -> IoResult<()> {
-        // Until update_memory has populated `self.mem`, we cannot safely
-        // dereference any descriptor chain. Drop the kick on the floor.
+        // EXIT must be honoured before any other check; the eventfd that
+        // backs it is independent of guest memory state.
+        if device_event == EXTRA_TOKEN_EXIT {
+            return Err(io::Error::other("shutdown requested via EXTRA_TOKEN_EXIT"));
+        }
+
+        // TIMER must drain the timerfd even before guest memory is mapped.
+        // The framework's epoll is level-triggered: if we early-return on
+        // `memory().is_none()` without reading the timerfd, the kernel will
+        // re-fire EXTRA_TOKEN_TIMER on every microsecond of the next
+        // epoll_wait, livelocking the vring worker thread until
+        // SET_MEM_TABLE eventually breaks the spin. The peer-update phase
+        // of `handle_timer_tick` does not touch guest memory, so it is safe
+        // to run even with `self.mem == None`; only `flush_rx` (which
+        // dereferences the rx vring) must wait until memory is available.
+        if device_event == EXTRA_TOKEN_TIMER {
+            let timer_result = self.handle_timer_tick();
+            if self.memory().is_none() {
+                return timer_result.map_err(|e| io::Error::other(e.to_string()));
+            }
+            let rx_vring = match vrings.get(usize::from(RX_QUEUE_EVENT)) {
+                Some(v) => v,
+                None => return Ok(()),
+            };
+            let tx_vring_opt = vrings.get(usize::from(TX_QUEUE_EVENT));
+            timer_result
+                .and_then(|_| self.flush_rx(rx_vring))
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            self.busy_poll_window(rx_vring, tx_vring_opt)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            return Ok(());
+        }
+
+        // Remaining tokens (RX/TX vring kicks and the WG UDP socket) all
+        // require valid guest memory before they can proceed. The vring
+        // kick fds are drained by the framework before this method runs,
+        // so dropping them here does not cause an epoll re-fire spin.
         if self.memory().is_none() {
             return Ok(());
         }
 
-        // The framework hands us a slice of length `num_queues()`, indexed
-        // by virtqueue number. RX = 0, TX = 1.
         let rx_vring = match vrings.get(usize::from(RX_QUEUE_EVENT)) {
             Some(v) => v,
             None => return Ok(()),
@@ -570,16 +603,6 @@ impl VhostUserBackendMut for WgNetBackend {
                 self.run_tx(rx_vring, tx_vring)
             }
             EXTRA_TOKEN_UDP => self.handle_wg_socket_readable(rx_vring),
-            EXTRA_TOKEN_TIMER => self.handle_timer_tick().and_then(|_| {
-                // Timer ticks may have unblocked WG TX (handshake completion);
-                // pump the RX queue in case anything backed up.
-                self.flush_rx(rx_vring)
-            }),
-            EXTRA_TOKEN_EXIT => {
-                // Returning Err propagates up through the framework's
-                // VringEpollHandler::run loop and breaks `daemon.serve()`.
-                return Err(io::Error::other("shutdown requested via EXTRA_TOKEN_EXIT"));
-            }
             other => {
                 tracing::warn!(token = other, "unknown_handle_event_token");
                 Ok(())

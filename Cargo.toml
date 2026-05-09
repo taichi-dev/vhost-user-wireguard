@@ -36,6 +36,7 @@ clap = { version = "4", features = ["derive", "env"] }
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-log = "0.2"
 rustix = { version = "0.38", features = ["fs", "process", "thread", "net", "termios"] }
 caps = "0.5"
 sd-notify = "0.4"

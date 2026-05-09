@@ -2,8 +2,9 @@
 
 //! Tracing-subscriber setup with text and JSON formatters.
 
-use crate::error::LoggingError;
 use tracing_subscriber::EnvFilter;
+
+use crate::error::LoggingError;
 
 /// Log output format.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +14,12 @@ pub enum LogFormat {
 }
 
 /// Initialise the global tracing subscriber.
+///
+/// Also installs a `log -> tracing` bridge so that `log::` macros emitted by
+/// upstream crates (e.g. the `vhost-user-backend` framework, `boringtun`)
+/// are captured by the same subscriber and obey the same `EnvFilter`.
+/// Without this bridge those records are silently dropped, which previously
+/// hid critical framework errors such as `vring_worker` thread exits.
 ///
 /// # Errors
 /// - [`LoggingError::InvalidFilter`] if `filter` is not a valid `EnvFilter` directive.
@@ -34,6 +41,10 @@ pub fn init(format: LogFormat, filter: &str) -> Result<(), LoggingError> {
             .try_init()
             .map_err(|_| LoggingError::AlreadyInstalled)?,
     }
+
+    // Bridge `log` records into the tracing subscriber. Idempotent across
+    // tests; failing here only means another LogTracer is already installed.
+    let _ = tracing_log::LogTracer::init();
 
     Ok(())
 }
