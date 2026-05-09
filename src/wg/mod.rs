@@ -82,10 +82,13 @@ impl WgEngine {
             None,
         )
         .map_err(|e| bind_err(e.into()))?;
-        rustix::net::sockopt::set_ipv6_v6only(&owned_fd, false)
-            .map_err(|e| bind_err(e.into()))?;
-        let bind_addr =
-            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, cfg.listen_port, 0, 0));
+        rustix::net::sockopt::set_ipv6_v6only(&owned_fd, false).map_err(|e| bind_err(e.into()))?;
+        let bind_addr = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::UNSPECIFIED,
+            cfg.listen_port,
+            0,
+            0,
+        ));
         rustix::net::bind(&owned_fd, &bind_addr).map_err(|e| bind_err(e.into()))?;
         let socket = UdpSocket::from(owned_fd);
         socket.set_nonblocking(true).map_err(bind_err)?;
@@ -207,11 +210,16 @@ impl WgEngine {
     /// Identify which peer a datagram is destined for.
     ///
     /// boringtun encodes `peer_idx` in the upper 24 bits of the local index it
-    /// hands out (`local_idx = peer_idx << 8 | session_bits`), so for any
-    /// non-handshake-init message we can cheaply derive the peer slot from
-    /// the receiver_idx field. For handshake init (no receiver_idx in the
-    /// wire packet), we either trust the single-peer common case or look the
-    /// remote sender_idx up in the cache populated on handshake completion.
+    /// hands out (`local_idx = peer_idx << 8 | session_bits`), so messages
+    /// that carry a receiver index can cheaply derive the peer slot from it.
+    ///
+    /// The receiver index is not at a single offset for all message types:
+    /// handshake responses carry `sender_idx` first and `receiver_idx` at
+    /// bytes 8..12, while data packets and cookie replies carry
+    /// `receiver_idx` at bytes 4..8. Reading bytes 8..12 for data packets
+    /// reads the packet counter; low-throughput traffic then appears to work
+    /// until the counter reaches 256 and the shifted value no longer resolves
+    /// to peer 0.
     fn identify_peer(&self, datagram: &[u8]) -> Option<usize> {
         if datagram.len() < 4 {
             return None;
@@ -229,11 +237,17 @@ impl WgEngine {
             return None;
         }
 
-        if datagram.len() < 12 {
-            return None;
-        }
-        let receiver_idx =
-            u32::from_le_bytes([datagram[8], datagram[9], datagram[10], datagram[11]]);
+        let receiver_idx = match msg_type {
+            // HandshakeResponse: type || sender_idx || receiver_idx || ...
+            2 if datagram.len() >= 12 => {
+                u32::from_le_bytes([datagram[8], datagram[9], datagram[10], datagram[11]])
+            }
+            // CookieReply and PacketData: type || receiver_idx || ...
+            3 | 4 if datagram.len() >= 8 => {
+                u32::from_le_bytes([datagram[4], datagram[5], datagram[6], datagram[7]])
+            }
+            _ => return None,
+        };
         if let Some(&idx) = self.recv_idx_to_peer.get(&receiver_idx) {
             return Some(idx);
         }
@@ -389,8 +403,7 @@ mod tests {
         let our_secret = make_secret(1);
         let cfg = one_peer_cfg();
         let engine = WgEngine::new(&cfg, &our_secret).expect("engine should build");
-        let v6only =
-            rustix::net::sockopt::get_ipv6_v6only(&engine.socket).expect("getsockopt");
+        let v6only = rustix::net::sockopt::get_ipv6_v6only(&engine.socket).expect("getsockopt");
         assert!(!v6only, "expected IPV6_V6ONLY=0 for dual-stack bind");
         // Sanity: the socket is reachable as a raw fd ≥ 0.
         assert!(engine.socket_fd() >= 0);
@@ -430,18 +443,12 @@ mod tests {
             persistent_keepalive: None,
         }]);
         let engine = WgEngine::new(&cfg, &our_secret).expect("engine should build");
-        assert_eq!(
-            engine.route.lookup_v4("10.0.0.1".parse().unwrap()),
-            Some(0)
-        );
+        assert_eq!(engine.route.lookup_v4("10.0.0.1".parse().unwrap()), Some(0));
         assert_eq!(
             engine.route.lookup_v4("10.0.0.255".parse().unwrap()),
             Some(0)
         );
-        assert_eq!(
-            engine.route.lookup_v4("192.168.1.1".parse().unwrap()),
-            None
-        );
+        assert_eq!(engine.route.lookup_v4("192.168.1.1".parse().unwrap()), None);
     }
 
     #[test]
@@ -483,5 +490,35 @@ mod tests {
         // surfacing as Ok(None).
         let r = engine.handle_socket_readable().expect("non-blocking recv");
         assert!(r.is_none(), "expected no datagram on fresh socket");
+    }
+
+    #[test]
+    fn test_identify_peer_uses_data_receiver_index_not_counter() {
+        let our_secret = make_secret(13);
+        let cfg = one_peer_cfg();
+        let engine = WgEngine::new(&cfg, &our_secret).expect("engine should build");
+        let receiver_idx = 0u32;
+        let counter = 256u64;
+        let mut datagram = vec![0u8; 32];
+        datagram[0..4].copy_from_slice(&4u32.to_le_bytes());
+        datagram[4..8].copy_from_slice(&receiver_idx.to_le_bytes());
+        datagram[8..16].copy_from_slice(&counter.to_le_bytes());
+
+        assert_eq!(engine.identify_peer(&datagram), Some(0));
+    }
+
+    #[test]
+    fn test_identify_peer_uses_handshake_response_receiver_index() {
+        let our_secret = make_secret(15);
+        let cfg = one_peer_cfg();
+        let engine = WgEngine::new(&cfg, &our_secret).expect("engine should build");
+        let sender_idx = 256u32;
+        let receiver_idx = 0u32;
+        let mut datagram = vec![0u8; 92];
+        datagram[0..4].copy_from_slice(&2u32.to_le_bytes());
+        datagram[4..8].copy_from_slice(&sender_idx.to_le_bytes());
+        datagram[8..12].copy_from_slice(&receiver_idx.to_le_bytes());
+
+        assert_eq!(engine.identify_peer(&datagram), Some(0));
     }
 }
