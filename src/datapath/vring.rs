@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use vhost_user_backend::{VringRwLock, VringT};
-use virtio_queue::{DescriptorChain, QueueOwnedT};
+use virtio_queue::{DescriptorChain, Error as VirtioQueueError, QueueOwnedT, QueueT};
 use vm_memory::{Bytes, GuestMemory};
 
 use crate::datapath::intercept::{DropReason, InterceptCfg, InterceptDecision, classify};
@@ -63,12 +63,15 @@ const IPV4_ADDR_LEN: usize = 4;
 /// single bucket (with payload `0`) so that the overall key set is bounded.
 /// `tx_frames` and `rx_frames` count successful dispatches in each direction;
 /// `rx_no_buffer_drops` counts frames evicted from the RX queue because the
-/// queue was full when [`RxProcessor::enqueue`] was invoked.
+/// queue was full when [`RxProcessor::enqueue`] was invoked;
+/// `rx_undersized_drops` counts frames dropped because the guest-posted RX
+/// descriptor chain could not hold `vnet_hdr + frame`.
 pub struct Counters {
     pub drops: HashMap<DropReason, AtomicU64>,
     pub tx_frames: AtomicU64,
     pub rx_frames: AtomicU64,
     pub rx_no_buffer_drops: AtomicU64,
+    pub rx_undersized_drops: AtomicU64,
 }
 
 impl Counters {
@@ -92,6 +95,7 @@ impl Counters {
             tx_frames: AtomicU64::new(0),
             rx_frames: AtomicU64::new(0),
             rx_no_buffer_drops: AtomicU64::new(0),
+            rx_undersized_drops: AtomicU64::new(0),
         }
     }
 
@@ -168,14 +172,15 @@ where
 
 /// Write `header` followed by `frame` into the writable side of `chain`.
 ///
-/// Returns the total number of bytes written (always `header.len() +
-/// frame.len()` on success). Returns `VhostError::Vring` when the writable
-/// segments cannot accommodate the full payload.
+/// Returns `Ok(Some(used_len))` on success (always `header.len() +
+/// frame.len()`), `Ok(None)` if the writable segments cannot accommodate
+/// the full payload (caller drops the frame and releases the chain), and
+/// `Err(VhostError)` for true memory-access faults.
 fn write_frame_to_chain<M>(
     chain: DescriptorChain<M>,
     header: &[u8],
     frame: &[u8],
-) -> Result<u32, VhostError>
+) -> Result<Option<u32>, VhostError>
 where
     M: Deref + Clone,
     M::Target: GuestMemory,
@@ -205,11 +210,10 @@ where
         bytes_written += chunk_len;
     }
     if payload_offset < payload.len() {
-        return Err(VhostError::Vring(
-            "RX descriptor chain too small for vnet header + frame".to_string(),
-        ));
+        return Ok(None);
     }
     u32::try_from(bytes_written)
+        .map(Some)
         .map_err(|_| VhostError::Vring("RX written length exceeds u32".to_string()))
 }
 
@@ -265,13 +269,21 @@ impl<'a, M: GuestMemory> RxProcessor<'a, M> {
         let header = vnet::serialize(&vnet::rx_header());
 
         let mut state = self.vring.get_mut();
+        // Tolerate the well-known race between a queued kick in our epoll and
+        // a GET_VRING_BASE on the protocol thread that flips queue.ready to
+        // false. The vhost-user spec mandates the device "stop the ring" on
+        // GET_VRING_BASE, so leaving frames in self.queue is correct: if the
+        // guest re-arms the ring later, a fresh kick will drain them.
+        if !state.get_queue().ready() {
+            return Ok(());
+        }
         let mut delivered = false;
         while !self.queue.is_empty() {
-            let chain_opt = state
-                .get_queue_mut()
-                .iter(self.mem)
-                .map_err(|e| VhostError::Vring(e.to_string()))?
-                .next();
+            let chain_opt = match state.get_queue_mut().iter(self.mem) {
+                Ok(mut iter) => iter.next(),
+                Err(VirtioQueueError::QueueNotReady) => return Ok(()),
+                Err(e) => return Err(VhostError::Vring(e.to_string())),
+            };
             let Some(chain) = chain_opt else {
                 break;
             };
@@ -286,12 +298,27 @@ impl<'a, M: GuestMemory> RxProcessor<'a, M> {
                     .map_err(|e| VhostError::Vring(e.to_string()))?;
                 break;
             };
-            let used_len = write_frame_to_chain(chain, &header, &frame)?;
-            state
-                .add_used(head_index, used_len)
-                .map_err(|e| VhostError::Vring(e.to_string()))?;
-            self.counters.rx_frames.fetch_add(1, Ordering::Relaxed);
-            delivered = true;
+            match write_frame_to_chain(chain, &header, &frame)? {
+                Some(used_len) => {
+                    state
+                        .add_used(head_index, used_len)
+                        .map_err(|e| VhostError::Vring(e.to_string()))?;
+                    self.counters.rx_frames.fetch_add(1, Ordering::Relaxed);
+                    delivered = true;
+                }
+                None => {
+                    // Guest posted a too-short descriptor chain. Release the
+                    // chain back with used_len=0 (so the guest can recycle it),
+                    // drop the frame on the floor, bump the counter, keep going.
+                    state
+                        .add_used(head_index, 0)
+                        .map_err(|e| VhostError::Vring(e.to_string()))?;
+                    self.counters
+                        .rx_undersized_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                    delivered = true;
+                }
+            }
         }
         if delivered {
             state.signal_used_queue().map_err(VhostError::EventFd)?;
@@ -328,17 +355,23 @@ impl<'r, 'a, M: GuestMemory> TxProcessor<'r, 'a, M> {
     /// kick would lose interrupts under EVENT_IDX.
     pub fn process(&mut self) -> Result<(), VhostError> {
         let mut state = self.vring.get_mut();
+        // Same race tolerance as RxProcessor::flush: a TX kick can be queued
+        // in our epoll while the protocol thread flips queue.ready to false
+        // via GET_VRING_BASE. Bail cleanly instead of crashing the worker.
+        if !state.get_queue().ready() {
+            return Ok(());
+        }
         loop {
             state
                 .disable_notification()
                 .map_err(|e| VhostError::Vring(e.to_string()))?;
 
             loop {
-                let chain_opt = state
-                    .get_queue_mut()
-                    .iter(self.mem)
-                    .map_err(|e| VhostError::Vring(e.to_string()))?
-                    .next();
+                let chain_opt = match state.get_queue_mut().iter(self.mem) {
+                    Ok(mut iter) => iter.next(),
+                    Err(VirtioQueueError::QueueNotReady) => return Ok(()),
+                    Err(e) => return Err(VhostError::Vring(e.to_string())),
+                };
                 let Some(chain) = chain_opt else {
                     break;
                 };
@@ -632,6 +665,52 @@ mod tests {
         assert_eq!(&buf[..10], &[0u8; 10]);
         assert_eq!(u16::from_le_bytes([buf[10], buf[11]]), 1);
         assert_eq!(&buf[12..], frame.as_slice());
+    }
+
+    #[test]
+    fn test_rx_flush_tolerates_not_ready_queue() {
+        // Reproduces the GET_VRING_BASE race: a kick is queued in our epoll
+        // when the protocol thread flips queue.ready to false. flush() must
+        // return Ok(()) without crashing the worker, and must leave the
+        // pending frame intact so it can be delivered on the next ring arm.
+        let (atomic, vring) = setup_vring();
+        let mem_handle = atomic.memory();
+        let mem: &GuestMemoryMmap = &mem_handle;
+        let counters = Counters::new();
+        let mut rx = RxProcessor::new(&vring, mem, 32, &counters);
+
+        rx.enqueue(vec![1u8; 40]);
+        vring.set_queue_ready(false);
+        rx.flush().unwrap();
+
+        assert_eq!(rx.queue.len(), 1, "frame must remain pending");
+        assert_eq!(counters.rx_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.rx_undersized_drops.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_rx_flush_drops_frame_when_descriptor_too_small() {
+        // Guest posts an RX descriptor too small for vnet_hdr (12B) + frame.
+        // Pre-fix this propagated VhostError::Vring up through handle_event
+        // and crashed the vring_worker thread; post-fix the frame is dropped,
+        // the descriptor chain is released with used_len=0, the counter is
+        // bumped, and flush returns Ok(()).
+        let (atomic, vring) = setup_vring();
+        let mem_handle = atomic.memory();
+        let mem: &GuestMemoryMmap = &mem_handle;
+
+        // 16-byte writable buffer cannot hold 12B header + 40B frame.
+        write_desc(mem, 0, BUFFER_BASE, 16, 0x2 /* WRITE */, 0);
+        publish_avail(mem, 0, 0, 1);
+
+        let counters = Counters::new();
+        let mut rx = RxProcessor::new(&vring, mem, 32, &counters);
+        rx.enqueue(vec![0xab; 40]);
+        rx.flush().unwrap();
+
+        assert!(rx.queue.is_empty(), "frame must be dropped, not retried");
+        assert_eq!(counters.rx_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.rx_undersized_drops.load(Ordering::Relaxed), 1);
     }
 
     #[test]
