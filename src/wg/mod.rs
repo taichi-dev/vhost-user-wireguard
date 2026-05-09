@@ -16,9 +16,9 @@
 pub mod keys;
 pub mod peer;
 pub mod routing;
+pub mod uring;
 
 use std::collections::HashMap;
-use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
@@ -33,9 +33,7 @@ use crate::config::Wireguard;
 use crate::error::WgError;
 use crate::wg::peer::{DecapResult, DrainResult, EncapResult, Peer, TimerResult};
 use crate::wg::routing::AllowedIpsRouter;
-
-/// Maximum size of a WireGuard UDP datagram on the wire (MTU + WG overhead).
-const MAX_DATAGRAM: usize = 1500 + 32 + 16;
+use crate::wg::uring::WgUring;
 
 /// Default scratch buffer for outbound encrypted bytes from boringtun.
 const OUT_BUF_LEN: usize = 2048;
@@ -50,16 +48,10 @@ pub struct RxIpPacket {
     pub packet: Vec<u8>,
 }
 
-/// Outcome of a single non-blocking poll on the WG UDP socket.
-enum SocketPollResult {
-    Idle,
-    Consumed,
-    Tunnel(RxIpPacket),
-}
-
 /// WireGuard engine: UDP socket + timer + peer dispatch.
 pub struct WgEngine {
     pub socket: UdpSocket,
+    pub uring: WgUring,
     pub peers: Vec<Peer>,
     pub route: AllowedIpsRouter,
     /// Maps boringtun-assigned local index → peer slot.
@@ -139,8 +131,11 @@ impl WgEngine {
             peers.push(peer);
         }
 
+        let uring = WgUring::new(socket.as_raw_fd())?;
+
         Ok(Self {
             socket,
+            uring,
             peers,
             route,
             recv_idx_to_peer: HashMap::new(),
@@ -150,38 +145,41 @@ impl WgEngine {
         })
     }
 
-    /// UDP socket fd for epoll / event-loop registration.
+    /// io_uring eventfd registered for epoll / event-loop dispatch.
+    /// Replaces the old `socket_fd()` registration: the framework's epoll
+    /// now wakes up on ring completions, not on socket readability.
+    pub fn ring_eventfd(&self) -> RawFd {
+        self.uring.eventfd()
+    }
+
     pub fn socket_fd(&self) -> RawFd {
         self.socket.as_raw_fd()
     }
 
-    /// Timer fd for epoll / event-loop registration.
     pub fn timer_fd_raw(&self) -> RawFd {
         self.timer_fd.as_raw_fd()
     }
 
-    /// Drain one UDP datagram from the socket.
-    /// Returns `Ok(None)` on `WouldBlock` or non-actionable result.
+    /// Drain a single completed recv from the io_uring CQ, dispatching it
+    /// through boringtun. Returns `Ok(None)` if no recv CQE was ready or if
+    /// the datagram resolved to a non-tunnel outcome (handshake, cookie,
+    /// allowed-ip violation).
     pub fn handle_socket_readable(&mut self) -> Result<Option<RxIpPacket>, WgError> {
-        match self.poll_socket_once()? {
-            SocketPollResult::Idle => Ok(None),
-            SocketPollResult::Consumed => Ok(None),
-            SocketPollResult::Tunnel(pkt) => Ok(Some(pkt)),
-        }
+        let mut out: Option<RxIpPacket> = None;
+        self.handle_socket_burst(1, |pkt| {
+            out = Some(pkt);
+        })?;
+        Ok(out)
     }
 
-    /// Drain up to `max_packets` UDP datagrams from the socket without
-    /// blocking. Each datagram that yields a tunnel-bound IPv4 packet is
-    /// passed to `sink`; non-tunnel datagrams (handshakes, cookies, replies
-    /// boringtun consumed internally) still count toward the budget.
+    /// Drain up to `max_packets` completed UDP recvs from the io_uring CQ.
+    /// Each datagram that yields a tunnel-bound IPv4 packet is passed to
+    /// `sink`; non-tunnel datagrams (handshakes, cookies, replies boringtun
+    /// consumed internally) still count toward the budget.
     ///
-    /// Returns the number of datagrams consumed (0 when the socket was idle
-    /// at entry). The loop exits on the first WouldBlock so the caller can
-    /// distinguish "budget exhausted" (returned == max_packets) from
-    /// "socket drained" (returned < max_packets).
-    ///
-    /// Used by the adaptive busy-poll loop in [`crate::datapath`] to amortise
-    /// epoll wake-ups under bursty inbound traffic.
+    /// Returns the number of datagrams consumed. Send completions accrued
+    /// during the same wake-up are reaped opportunistically (their slots are
+    /// returned to the pool) but do not count toward `max_packets`.
     pub fn handle_socket_burst<F>(
         &mut self,
         max_packets: usize,
@@ -190,32 +188,33 @@ impl WgEngine {
     where
         F: FnMut(RxIpPacket),
     {
-        let mut drained = 0usize;
-        while drained < max_packets {
-            match self.poll_socket_once()? {
-                SocketPollResult::Idle => break,
-                SocketPollResult::Consumed => drained += 1,
-                SocketPollResult::Tunnel(pkt) => {
-                    sink(pkt);
-                    drained += 1;
-                }
+        if max_packets == 0 {
+            return Ok(0);
+        }
+        self.uring.drain_eventfd();
+        let mut datagrams: Vec<(SocketAddr, Vec<u8>)> = Vec::with_capacity(max_packets);
+        let consumed = self.uring.handle_completions(max_packets, |src, buf| {
+            datagrams.push((src, buf.to_vec()));
+        })?;
+        for (src_addr, datagram) in datagrams {
+            if let Some(pkt) = self.process_datagram(src_addr, &datagram)? {
+                sink(pkt);
             }
         }
-        Ok(drained)
+        self.uring.submit()?;
+        Ok(consumed)
     }
 
-    /// Single non-blocking poll of the WG socket. Returns a tri-state so
-    /// callers can distinguish socket-empty from non-tunnel-datagram-consumed
-    /// (which look identical through [`Self::handle_socket_readable`]).
-    fn poll_socket_once(&mut self) -> Result<SocketPollResult, WgError> {
-        let mut buf = [0u8; MAX_DATAGRAM];
-        let (n, src_addr) = match self.socket.recv_from(&mut buf) {
-            Ok(p) => p,
-            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(SocketPollResult::Idle),
-            Err(e) => return Err(WgError::SocketSend(e)),
-        };
-        let datagram = &buf[..n];
-
+    /// Decapsulate one UDP datagram (already drained from the ring) through
+    /// boringtun and either emit a tunnel-bound IP packet or absorb the
+    /// datagram (handshake, cookie, drop). Side effects:
+    ///   * Outbound responses go straight back through the io_uring SQ.
+    ///   * Allowed-IP-violating tunnel packets are logged + dropped.
+    fn process_datagram(
+        &mut self,
+        src_addr: SocketAddr,
+        datagram: &[u8],
+    ) -> Result<Option<RxIpPacket>, WgError> {
         let peer_idx = match self.identify_peer(datagram) {
             Some(idx) => idx,
             None => {
@@ -227,13 +226,13 @@ impl WgEngine {
                     Err(_) => ("invalid", None),
                 };
                 tracing::trace!(
-                    bytes = n,
+                    bytes = datagram.len(),
                     %src_addr,
                     msg_type,
                     receiver_idx = ?receiver_idx,
                     "wg_unknown_peer_for_datagram"
                 );
-                return Ok(SocketPollResult::Consumed);
+                return Ok(None);
             }
         };
 
@@ -242,11 +241,9 @@ impl WgEngine {
         match result {
             DecapResult::WriteToNetwork(len) => {
                 let endpoint = self.peers[peer_idx].current_endpoint;
-                self.socket
-                    .send_to(&out[..len], endpoint)
-                    .map_err(WgError::SocketSend)?;
+                self.uring.queue_send(&out[..len], endpoint)?;
                 self.drain_peer(peer_idx, &mut out)?;
-                Ok(SocketPollResult::Consumed)
+                Ok(None)
             }
             DecapResult::WriteToTunnelV4 { src_ip, packet_len } => {
                 if !self.peers[peer_idx].allowed_ip_check(src_ip) {
@@ -255,19 +252,19 @@ impl WgEngine {
                         peer = %self.peers[peer_idx].name,
                         "wg_allowed_ip_violation"
                     );
-                    return Ok(SocketPollResult::Consumed);
+                    return Ok(None);
                 }
                 let packet = out[..packet_len].to_vec();
-                Ok(SocketPollResult::Tunnel(RxIpPacket {
+                Ok(Some(RxIpPacket {
                     peer_idx,
                     src_ip,
                     packet,
                 }))
             }
-            DecapResult::Done => Ok(SocketPollResult::Consumed),
+            DecapResult::Done => Ok(None),
             DecapResult::Err(e) => {
                 tracing::trace!(error = %e, "wg_decapsulate_error");
-                Ok(SocketPollResult::Consumed)
+                Ok(None)
             }
         }
     }
@@ -297,7 +294,6 @@ impl WgEngine {
 
     /// Tick all peer timers. Caller must invoke when the timer fd is readable.
     pub fn handle_timer_tick(&mut self) -> Result<(), WgError> {
-        // Drain the timerfd so it stays edge-triggerable.
         let _expirations = self.timer_fd.wait().map_err(timerfd_err)?;
 
         let mut out = [0u8; OUT_BUF_LEN];
@@ -306,9 +302,7 @@ impl WgEngine {
             match result {
                 TimerResult::Ready(len) => {
                     let endpoint = self.peers[idx].current_endpoint;
-                    self.socket
-                        .send_to(&out[..len], endpoint)
-                        .map_err(WgError::SocketSend)?;
+                    self.uring.queue_send(&out[..len], endpoint)?;
                 }
                 TimerResult::ConnectionExpired => {
                     tracing::info!(
@@ -324,18 +318,16 @@ impl WgEngine {
                     };
                     if let Some(len) = send_len {
                         let endpoint = self.peers[idx].current_endpoint;
-                        self.socket
-                            .send_to(&out[..len], endpoint)
-                            .map_err(WgError::SocketSend)?;
+                        self.uring.queue_send(&out[..len], endpoint)?;
                     }
                 }
                 TimerResult::Done => {}
             }
         }
+        self.uring.submit()?;
         Ok(())
     }
 
-    /// Encapsulate and emit one outbound IPv4 packet to its routed peer.
     pub fn handle_tx_ip_packet(
         &mut self,
         dst_ip: Ipv4Addr,
@@ -351,10 +343,9 @@ impl WgEngine {
         match result {
             EncapResult::WriteToNetwork(len) | EncapResult::Ready(len) => {
                 let endpoint = self.peers[peer_idx].current_endpoint;
-                self.socket
-                    .send_to(&out[..len], endpoint)
-                    .map_err(WgError::SocketSend)?;
+                self.uring.queue_send(&out[..len], endpoint)?;
                 self.drain_peer(peer_idx, &mut out)?;
+                self.uring.submit()?;
                 Ok(())
             }
             EncapResult::Done => Ok(()),
@@ -362,16 +353,12 @@ impl WgEngine {
         }
     }
 
-    /// Drain any packets boringtun queued for the peer (handshake retransmits,
-    /// session-deferred sends).
     fn drain_peer(&mut self, peer_idx: usize, out: &mut [u8]) -> Result<(), WgError> {
         loop {
             match self.peers[peer_idx].drain(out) {
                 DrainResult::WriteToNetwork(len) => {
                     let endpoint = self.peers[peer_idx].current_endpoint;
-                    self.socket
-                        .send_to(&out[..len], endpoint)
-                        .map_err(WgError::SocketSend)?;
+                    self.uring.queue_send(&out[..len], endpoint)?;
                 }
                 DrainResult::Done => return Ok(()),
             }

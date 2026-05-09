@@ -27,6 +27,9 @@ vmm-sys-util = "0.15"
 boringtun = "0.7.0"
 dhcproto = "0.14"
 etherparse = "0.20"
+io-uring = "0.7"
+libc = "0.2"
+socket2 = "0.5"
 ipnet = "2"
 ip_network_table = "0.2"
 ip_network = { version = "0.4", features = ["serde"] }
@@ -57,7 +60,6 @@ predicates = "3"
 # Cargo unifies feature flags between [dependencies] and [dev-dependencies].
 vhost = { version = "0.16", features = ["vhost-user-frontend"] }
 vmm-sys-util = "0.15"
-libc = "0.2"
 
 [profile.release]
 lto = "thin"

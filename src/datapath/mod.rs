@@ -208,13 +208,12 @@ impl WgNetBackend {
         Arc::clone(&self.counters)
     }
 
-    /// Raw fd of the UDP socket — needed by [`register_external_fds`] callers
-    /// that don't already hold a [`WgEngine`] reference.
-    pub fn wg_socket_fd(&self) -> RawFd {
-        self.wg.socket_fd()
+    /// Raw fd of the io_uring eventfd — registered with the framework's epoll
+    /// at the [`EXTRA_TOKEN_UDP`] slot so completions wake `handle_event`.
+    pub fn wg_uring_eventfd(&self) -> RawFd {
+        self.wg.ring_eventfd()
     }
 
-    /// Raw fd of the WireGuard 1 Hz timerfd.
     pub fn wg_timer_fd(&self) -> RawFd {
         self.wg.timer_fd_raw()
     }
@@ -615,7 +614,7 @@ impl VhostUserBackendMut for WgNetBackend {
     }
 }
 
-/// Register the WG UDP socket, the WG timerfd and the externally-driven
+/// Register the WG io_uring eventfd, the WG timerfd, and the externally-driven
 /// shutdown fd with the framework's [`VringEpollHandler`].
 ///
 /// This MUST be re-invoked every time the daemon's serve loop terminates and
@@ -627,7 +626,7 @@ impl VhostUserBackendMut for WgNetBackend {
 /// must match the dispatch table inside [`WgNetBackend::handle_event`].
 pub fn register_external_fds<T>(
     handler: &VringEpollHandler<T>,
-    wg_socket_fd: RawFd,
+    wg_uring_eventfd: RawFd,
     timer_fd: RawFd,
     exit_fd: RawFd,
 ) -> Result<(), VhostError>
@@ -635,7 +634,7 @@ where
     T: VhostUserBackend,
 {
     handler
-        .register_listener(wg_socket_fd, EventSet::IN, u64::from(EXTRA_TOKEN_UDP))
+        .register_listener(wg_uring_eventfd, EventSet::IN, u64::from(EXTRA_TOKEN_UDP))
         .map_err(VhostError::EventFd)?;
     handler
         .register_listener(timer_fd, EventSet::IN, u64::from(EXTRA_TOKEN_TIMER))
@@ -678,11 +677,11 @@ pub fn run_serve_loop(
 ) -> Result<(), Error> {
     use vhost::vhost_user::Listener;
 
-    let (wg_socket_fd, timer_fd, exit_fd) = {
-        let b = backend
-            .lock()
-            .map_err(|_| Error::Vhost(VhostError::Backend("backend mutex poisoned".to_string())))?;
-        (b.wg_socket_fd(), b.wg_timer_fd(), b.exit_fd())
+    let (wg_uring_eventfd, timer_fd, exit_fd) = {
+        let backend_arc = daemon.get_epoll_handlers();
+        let _ = backend_arc;
+        let b = backend.lock().unwrap();
+        (b.wg_uring_eventfd(), b.wg_timer_fd(), b.exit_fd())
     };
 
     let mut listener = Listener::new(socket_path, true)
@@ -704,7 +703,7 @@ pub fn run_serve_loop(
             .map_err(|e| Error::Vhost(VhostError::Backend(e.to_string())))?;
 
         for handler in daemon.get_epoll_handlers() {
-            register_external_fds(&handler, wg_socket_fd, timer_fd, exit_fd)?;
+            register_external_fds(&handler, wg_uring_eventfd, timer_fd, exit_fd)?;
         }
 
         match daemon.wait() {
