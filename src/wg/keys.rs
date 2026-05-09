@@ -2,9 +2,10 @@
 
 //! WireGuard key loading and parsing utilities.
 
+use std::path::Path;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use std::path::Path;
 
 use crate::error::WgError;
 
@@ -36,7 +37,9 @@ pub fn load_preshared_key(path: &Path) -> Result<[u8; 32], WgError> {
 pub fn parse_private_key_base64(s: &str) -> Result<x25519_dalek::StaticSecret, WgError> {
     let bytes = STANDARD.decode(s.trim())?;
     if bytes.len() != 32 {
-        return Err(WgError::KeyLength { length: bytes.len() });
+        return Err(WgError::KeyLength {
+            length: bytes.len(),
+        });
     }
     // SAFETY: bytes.len() == 32 is verified by the check above; try_into cannot fail
     let arr: [u8; 32] = bytes.try_into().expect("length checked above");
@@ -47,7 +50,9 @@ pub fn parse_private_key_base64(s: &str) -> Result<x25519_dalek::StaticSecret, W
 pub fn parse_preshared_key_base64(s: &str) -> Result<[u8; 32], WgError> {
     let bytes = STANDARD.decode(s.trim())?;
     if bytes.len() != 32 {
-        return Err(WgError::KeyLength { length: bytes.len() });
+        return Err(WgError::KeyLength {
+            length: bytes.len(),
+        });
     }
     // SAFETY: bytes.len() == 32 is verified by the check above; try_into cannot fail
     let arr: [u8; 32] = bytes.try_into().expect("length checked above");
@@ -79,9 +84,10 @@ fn check_key_file_mode(path: &Path) -> Result<(), WgError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
 
     /// Generate a valid 32-byte base64 key string.
     fn valid_key_b64() -> String {
@@ -124,7 +130,10 @@ mod tests {
     fn test_reject_world_readable() {
         let f = write_key_file(0o644);
         let result = load_private_key(f.path());
-        assert!(matches!(result, Err(WgError::KeyFileMode { mode: 0o644, .. })));
+        assert!(matches!(
+            result,
+            Err(WgError::KeyFileMode { mode: 0o644, .. })
+        ));
     }
 
     #[test]
@@ -146,7 +155,10 @@ mod tests {
         let public = x25519_dalek::PublicKey::from(&secret);
         let fp = key_fingerprint(&public);
         assert_eq!(fp.len(), 11, "fingerprint should be 11 chars, got: {fp}");
-        assert!(fp.ends_with("..."), "fingerprint should end with '...', got: {fp}");
+        assert!(
+            fp.ends_with("..."),
+            "fingerprint should end with '...', got: {fp}"
+        );
     }
 
     #[test]

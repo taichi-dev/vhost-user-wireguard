@@ -37,9 +37,13 @@ pub struct Lease {
 
 mod serde_system_time {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     pub fn serialize<S: Serializer>(t: &SystemTime, s: S) -> Result<S::Ok, S::Error> {
-        t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs().serialize(s)
+        t.duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .serialize(s)
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<SystemTime, D::Error> {
         let secs = u64::deserialize(d)?;
@@ -189,8 +193,9 @@ impl LeaseStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::{Duration, SystemTime};
+
+    use super::*;
 
     fn mac(b: u8) -> [u8; 6] {
         [b, 0, 0, 0, 0, 0]
@@ -212,7 +217,10 @@ mod tests {
         let start = u32::from(Ipv4Addr::new(10, 0, 0, 1));
         let end = u32::from(Ipv4Addr::new(10, 0, 0, 3));
         let ip_u32 = u32::from(ip);
-        assert!(ip_u32 >= start && ip_u32 <= end, "IP {ip} not in pool range");
+        assert!(
+            ip_u32 >= start && ip_u32 <= end,
+            "IP {ip} not in pool range"
+        );
     }
 
     #[test]

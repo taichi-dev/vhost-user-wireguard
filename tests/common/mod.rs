@@ -50,12 +50,9 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
+use vhost::vhost_user::{Frontend, VhostUserFrontend};
 use vhost::{VhostBackend, VhostUserMemoryRegionInfo, VringConfigData};
-use vhost::vhost_user::Frontend;
-use vhost::vhost_user::VhostUserFrontend;
-use vhost::vhost_user::message::{
-    VhostUserProtocolFeatures, VhostUserVirtioFeatures,
-};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
 pub const DAEMON_BIN: &str = "target/release/vhost-user-wireguard";
@@ -152,10 +149,7 @@ start = "10.42.0.2"
 end = "10.42.0.2"
 "#;
 
-pub fn write_temp_config(
-    template: &str,
-    fields: BTreeMap<&str, &str>,
-) -> tempfile::TempPath {
+pub fn write_temp_config(template: &str, fields: BTreeMap<&str, &str>) -> tempfile::TempPath {
     let mut rendered = template.to_string();
     for (key, value) in fields {
         let needle = format!("{{{key}}}");
@@ -250,10 +244,10 @@ pub fn fake_notify_socket() -> (PathBuf, JoinHandle<Vec<String>>) {
 }
 
 pub fn build_dhcp_discover(mac: [u8; 6]) -> Vec<u8> {
-    use dhcproto::{Encoder, Encodable as _};
     use dhcproto::v4::{
         DhcpOption, DhcpOptions, Flags, HType, Message, MessageType, Opcode, OptionCode,
     };
+    use dhcproto::{Encodable as _, Encoder};
 
     let mut msg = Message::default();
     msg.set_opcode(Opcode::BootRequest);
@@ -504,14 +498,7 @@ impl RingPair {
 
     /// Write a fresh descriptor into slot `slot`, returning the head index
     /// to publish.
-    fn write_descriptor(
-        &self,
-        mem: &SharedMem,
-        slot: u16,
-        addr: u64,
-        len: u32,
-        flags: u16,
-    ) -> u16 {
+    fn write_descriptor(&self, mem: &SharedMem, slot: u16, addr: u64, len: u32, flags: u16) -> u16 {
         let mut bytes = [0u8; 16];
         bytes[0..8].copy_from_slice(&addr.to_le_bytes());
         bytes[8..12].copy_from_slice(&len.to_le_bytes());
@@ -651,18 +638,15 @@ impl MockVhostUserMaster {
         let mut command = Command::new(&bin);
         let cfg_arg: &Path = config_path.as_ref();
         let stderr_path = work_dir.path().join("daemon.stderr.log");
-        let stderr_file = std::fs::File::create(&stderr_path)
-            .expect("create daemon stderr log");
+        let stderr_file = std::fs::File::create(&stderr_path).expect("create daemon stderr log");
         command
             .arg("--config")
             .arg(cfg_arg)
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file));
-        let log_filter = log_filter_override
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                std::env::var("VUWG_TEST_LOG").unwrap_or_else(|_| "off".to_string())
-            });
+        let log_filter = log_filter_override.map(str::to_string).unwrap_or_else(|| {
+            std::env::var("VUWG_TEST_LOG").unwrap_or_else(|_| "off".to_string())
+        });
         if log_filter != "off" {
             command.arg("--log-filter").arg(&log_filter);
         }
@@ -812,8 +796,8 @@ impl MockVhostUserMaster {
         let bin = resolve_daemon_binary();
         let mut command = Command::new(&bin);
         let cfg_arg: &Path = self.config_path.as_ref();
-        let stderr_file = std::fs::File::create(&self.stderr_path)
-            .expect("recreate daemon stderr log");
+        let stderr_file =
+            std::fs::File::create(&self.stderr_path).expect("recreate daemon stderr log");
         command
             .arg("--config")
             .arg(cfg_arg)
@@ -995,9 +979,7 @@ impl MockVhostUserMaster {
     /// the AC-VU-3 smoke test to verify the header layout end-to-end.
     pub fn read_rx_frame_with_header(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
         let target = self.rx.last_used_idx.wrapping_add(1);
-        if wait_for_used_advance(&self.mem, &self.rx, target, Duration::from_secs(1))
-            .is_err()
-        {
+        if wait_for_used_advance(&self.mem, &self.rx, target, Duration::from_secs(1)).is_err() {
             return None;
         }
         let (id, len) = self.rx.read_used_elem(&self.mem, self.rx.last_used_idx);
@@ -1012,8 +994,10 @@ impl MockVhostUserMaster {
         );
         let header = unsafe { self.mem.read_bytes(buf_addr, VNET_HDR_LEN) };
         let frame_len = total - VNET_HDR_LEN;
-        let frame =
-            unsafe { self.mem.read_bytes(buf_addr + VNET_HDR_LEN as u64, frame_len) };
+        let frame = unsafe {
+            self.mem
+                .read_bytes(buf_addr + VNET_HDR_LEN as u64, frame_len)
+        };
 
         self.rx.write_descriptor(
             &self.mem,
@@ -1044,8 +1028,7 @@ fn wait_for_used_advance(
     while Instant::now() < deadline {
         let observed = ring.read_used_idx(mem);
         if observed == target
-            || observed.wrapping_sub(target) <= QUEUE_SIZE
-                && observed != ring.last_used_idx
+            || observed.wrapping_sub(target) <= QUEUE_SIZE && observed != ring.last_used_idx
         {
             return Ok(());
         }

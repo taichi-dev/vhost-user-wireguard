@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
 
 use dhcproto::v4::{
-    Decodable, Decoder, DhcpOption, Encodable, Encoder, Flags, HType, Message, MessageType,
-    Opcode, OptionCode,
+    Decodable, Decoder, DhcpOption, Encodable, Encoder, Flags, HType, Message, MessageType, Opcode,
+    OptionCode,
 };
 
 use crate::config::{Dhcp, Network, Vm};
@@ -150,8 +150,7 @@ impl DhcpServer {
     }
 
     pub fn checkpoint(&mut self) -> Result<(), DhcpError> {
-        let leases: Vec<crate::dhcp::lease::Lease> =
-            self.store.iter_leases().cloned().collect();
+        let leases: Vec<crate::dhcp::lease::Lease> = self.store.iter_leases().cloned().collect();
         let snap = LeaseSnapshot { version: 1, leases };
         self.persist.save(&snap)?;
         self.last_checkpoint = Instant::now();
@@ -175,10 +174,7 @@ impl DhcpServer {
         chaddr: [u8; 6],
         now: SystemTime,
     ) -> Result<Option<Message>, DhcpError> {
-        let server_id_set = request
-            .opts()
-            .get(OptionCode::ServerIdentifier)
-            .is_some();
+        let server_id_set = request.opts().get(OptionCode::ServerIdentifier).is_some();
         let requested_ip = match request.opts().get(OptionCode::RequestedIpAddress) {
             Some(DhcpOption::RequestedIpAddress(ip)) => Some(*ip),
             _ => None,
@@ -456,7 +452,6 @@ impl LeaseStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::{Duration, UNIX_EPOCH};
 
     use dhcproto::v4::{DhcpOptions, Flags as DhcpFlags};
@@ -464,6 +459,7 @@ mod tests {
     use mac_address::MacAddress;
     use tempfile::TempDir;
 
+    use super::*;
     use crate::config::{DhcpPool, DhcpReservation};
 
     const VM_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
@@ -660,10 +656,7 @@ mod tests {
             Ipv4Addr::UNSPECIFIED,
             Ipv4Addr::BROADCAST,
         );
-        let ack_bytes = server
-            .handle_packet(&req, now)
-            .unwrap()
-            .expect("ack");
+        let ack_bytes = server.handle_packet(&req, now).unwrap().expect("ack");
         let (ack, _, _) = parse_reply(&ack_bytes);
         assert_eq!(ack.opts().msg_type(), Some(MessageType::Ack));
         assert_eq!(ack.yiaddr(), yiaddr);
@@ -700,10 +693,7 @@ mod tests {
             Ipv4Addr::UNSPECIFIED,
             Ipv4Addr::BROADCAST,
         );
-        let ack_bytes = server
-            .handle_packet(&req, now)
-            .unwrap()
-            .expect("ack");
+        let ack_bytes = server.handle_packet(&req, now).unwrap().expect("ack");
         let (ack, _, _) = parse_reply(&ack_bytes);
         assert_eq!(ack.opts().msg_type(), Some(MessageType::Ack));
         assert_eq!(ack.yiaddr(), reserved);
@@ -719,7 +709,9 @@ mod tests {
         let req = build_request_frame(
             VM_MAC,
             MessageType::Request,
-            vec![DhcpOption::RequestedIpAddress(Ipv4Addr::new(192, 168, 99, 1))],
+            vec![DhcpOption::RequestedIpAddress(Ipv4Addr::new(
+                192, 168, 99, 1,
+            ))],
             Ipv4Addr::UNSPECIFIED,
             true,
             Ipv4Addr::UNSPECIFIED,
@@ -872,10 +864,7 @@ mod tests {
         let reply = server.handle_packet(&decline, now).unwrap();
         assert!(reply.is_none(), "DECLINE must not produce a reply");
 
-        let next_ip = server
-            .store
-            .allocate([0xaa; 6], now)
-            .expect("alloc fresh");
+        let next_ip = server.store.allocate([0xaa; 6], now).expect("alloc fresh");
         assert_ne!(next_ip, leased, "probation IP should not be reallocated");
     }
 

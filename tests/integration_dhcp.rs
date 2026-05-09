@@ -21,12 +21,11 @@ mod common;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
+use common::{MockVhostUserMaster, VM_MAC, build_dhcp_discover};
 use dhcproto::v4::{
     DhcpOption, DhcpOptions, Flags, HType, Message, MessageType, Opcode, OptionCode,
 };
 use dhcproto::{Decodable as _, Decoder, Encodable as _, Encoder};
-
-use common::{MockVhostUserMaster, VM_MAC, build_dhcp_discover};
 
 const VM_IP: Ipv4Addr = Ipv4Addr::new(10, 42, 0, 2);
 const SERVER_ID: Ipv4Addr = Ipv4Addr::new(10, 42, 0, 1);
@@ -66,11 +65,7 @@ fn build_dhcp_request_selecting(
     )
 }
 
-fn build_dhcp_request_init_reboot(
-    mac: [u8; 6],
-    requested_ip: Ipv4Addr,
-    xid: u32,
-) -> Vec<u8> {
+fn build_dhcp_request_init_reboot(mac: [u8; 6], requested_ip: Ipv4Addr, xid: u32) -> Vec<u8> {
     build_dhcp_frame(
         mac,
         mac,
@@ -120,12 +115,7 @@ fn build_dhcp_decline(
     )
 }
 
-fn build_dhcp_release(
-    mac: [u8; 6],
-    leased_ip: Ipv4Addr,
-    server_id: Ipv4Addr,
-    xid: u32,
-) -> Vec<u8> {
+fn build_dhcp_release(mac: [u8; 6], leased_ip: Ipv4Addr, server_id: Ipv4Addr, xid: u32) -> Vec<u8> {
     build_dhcp_frame(
         mac,
         mac,
@@ -356,7 +346,11 @@ fn test_discover_offer_request_ack_full_dora() {
     }
 
     if let Some(DhcpOption::Router(routers)) = ack.opts().get(OptionCode::Router) {
-        assert_eq!(routers, &vec![SERVER_ID], "ACK router must point at gateway");
+        assert_eq!(
+            routers,
+            &vec![SERVER_ID],
+            "ACK router must point at gateway"
+        );
     } else {
         panic!("ACK option 3 is not a Router list");
     }

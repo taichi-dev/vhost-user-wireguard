@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::wire::arp::{build_arp_reply, ArpPacket};
-use crate::wire::eth::{build_eth_frame, EthFrame};
 use std::net::Ipv4Addr;
+
+use crate::wire::arp::{ArpPacket, build_arp_reply};
+use crate::wire::eth::{EthFrame, build_eth_frame};
 
 const ETHERTYPE_ARP: u16 = 0x0806;
 const ARP_OPERATION_REQUEST: u16 = 1;
@@ -36,7 +37,12 @@ pub fn handle_arp_request(
         arp.sender_proto_addr(),
     );
 
-    Some(build_eth_frame(vm_mac, gateway_mac, ETHERTYPE_ARP, &arp_reply))
+    Some(build_eth_frame(
+        vm_mac,
+        gateway_mac,
+        ETHERTYPE_ARP,
+        &arp_reply,
+    ))
 }
 
 #[cfg(test)]

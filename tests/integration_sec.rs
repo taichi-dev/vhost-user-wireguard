@@ -38,14 +38,11 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use common::{GATEWAY_MAC, MockVhostUserMaster, VM_IP, VM_MAC, build_dhcp_discover, fake_wg_key};
 use dhcproto::v4::{
     DhcpOption, DhcpOptions, Flags, HType, Message, MessageType, Opcode, OptionCode,
 };
 use dhcproto::{Decodable as _, Decoder, Encodable as _, Encoder};
-
-use common::{
-    GATEWAY_MAC, MockVhostUserMaster, VM_IP, VM_MAC, build_dhcp_discover, fake_wg_key,
-};
 
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_IPV6: u16 = 0x86DD;
@@ -156,7 +153,12 @@ fn build_dhcp_request_selecting(
     udp.extend_from_slice(&0u16.to_be_bytes());
     udp.extend_from_slice(&dhcp_buf);
 
-    let ip = build_ipv4(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, IPPROTO_UDP, &udp);
+    let ip = build_ipv4(
+        Ipv4Addr::UNSPECIFIED,
+        Ipv4Addr::BROADCAST,
+        IPPROTO_UDP,
+        &udp,
+    );
 
     let mut frame = Vec::with_capacity(14 + ip.len());
     frame.extend_from_slice(&[0xff; 6]);
@@ -178,8 +180,7 @@ fn parse_dhcp_reply(eth_frame: &[u8]) -> Message {
     let ihl = usize::from(ip_payload[0] & 0x0f) * 4;
     assert_eq!(ip_payload[9], IPPROTO_UDP, "reply must be UDP");
     let dhcp_offset = ihl + 8;
-    Message::decode(&mut Decoder::new(&ip_payload[dhcp_offset..]))
-        .expect("decode dhcp reply")
+    Message::decode(&mut Decoder::new(&ip_payload[dhcp_offset..])).expect("decode dhcp reply")
 }
 
 /// Drive a full DORA so the daemon binds the guest's MAC to `VM_IP`. After
@@ -338,8 +339,7 @@ fn test_jumbo_frame_emits_icmp_t3c4() {
 
     let icmp_offset = ip_offset + ihl;
     assert_eq!(
-        reply[icmp_offset],
-        ICMP_TYPE_DEST_UNREACH,
+        reply[icmp_offset], ICMP_TYPE_DEST_UNREACH,
         "ICMP type must be 3 (Destination Unreachable)"
     );
     assert_eq!(
@@ -348,8 +348,7 @@ fn test_jumbo_frame_emits_icmp_t3c4() {
         "ICMP code must be 4 (Fragmentation Needed)"
     );
 
-    let mtu_in_reply =
-        u16::from_be_bytes([reply[icmp_offset + 6], reply[icmp_offset + 7]]);
+    let mtu_in_reply = u16::from_be_bytes([reply[icmp_offset + 6], reply[icmp_offset + 7]]);
     assert_eq!(
         mtu_in_reply, VM_MTU,
         "ICMP next-hop MTU must equal vm.mtu (got {mtu_in_reply}, want {VM_MTU})"
@@ -432,8 +431,7 @@ end = "10.42.0.2"
         priv_b64_check, priv_key_b64,
         "self-test: base64(priv_bytes) must match the config string"
     );
-    let priv_hex_check: String =
-        priv_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let priv_hex_check: String = priv_bytes.iter().map(|b| format!("{b:02x}")).collect();
 
     let psk_bytes = [psk_seed; 32];
     let psk_b64_check = BASE64.encode(psk_bytes);
@@ -441,8 +439,7 @@ end = "10.42.0.2"
         psk_b64_check, psk_b64,
         "self-test: base64(psk_bytes) must match"
     );
-    let psk_hex_check: String =
-        psk_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let psk_hex_check: String = psk_bytes.iter().map(|b| format!("{b:02x}")).collect();
 
     assert!(
         !stderr.contains(&priv_key_b64),
@@ -498,8 +495,7 @@ fn test_priv_drop_yields_zero_capeff() {
     let master = MockVhostUserMaster::spawn();
     let pid = read_daemon_pid(master.stderr_path());
 
-    let status =
-        fs::read_to_string(format!("/proc/{pid}/status")).expect("read /proc/$pid/status");
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).expect("read /proc/$pid/status");
 
     let cap_eff = status
         .lines()
@@ -548,8 +544,7 @@ fn test_priv_drop_blocks_privileged_bind() {
     let master = MockVhostUserMaster::spawn();
     let pid = read_daemon_pid(master.stderr_path());
 
-    let status =
-        fs::read_to_string(format!("/proc/{pid}/status")).expect("read /proc/$pid/status");
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).expect("read /proc/$pid/status");
     let cap_bnd = status
         .lines()
         .find(|line| line.starts_with("CapBnd:"))
@@ -576,15 +571,17 @@ fn test_priv_drop_blocks_privileged_bind() {
 /// privilege tests; the harness doesn't expose `child.id()` directly.
 fn read_daemon_pid(stderr_path: &std::path::Path) -> u32 {
     let _ = stderr_path;
-    let bin_canonical = std::fs::canonicalize(common::DAEMON_BIN)
-        .expect("resolve daemon binary path");
+    let bin_canonical =
+        std::fs::canonicalize(common::DAEMON_BIN).expect("resolve daemon binary path");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         for entry in std::fs::read_dir("/proc").expect("read /proc") {
             let Ok(entry) = entry else { continue };
             let name = entry.file_name();
-            let Some(name_str) = name.to_str() else { continue };
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
             let Ok(pid) = name_str.parse::<u32>() else {
                 continue;
             };

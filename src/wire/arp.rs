@@ -56,8 +56,9 @@ pub fn build_arp_reply(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::Ipv4Addr;
+
+    use super::*;
 
     #[test]
     fn test_new_too_short() {

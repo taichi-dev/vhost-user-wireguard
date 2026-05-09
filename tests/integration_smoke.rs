@@ -9,8 +9,7 @@ use std::os::unix::net::UnixDatagram;
 use std::time::Duration;
 
 use common::{
-    GATEWAY_IP, MockVhostUserMaster, VM_IP, VM_MAC, build_arp_request,
-    fake_notify_socket,
+    GATEWAY_IP, MockVhostUserMaster, VM_IP, VM_MAC, build_arp_request, fake_notify_socket,
 };
 
 #[test]
@@ -280,10 +279,7 @@ fn test_sd_notify_protocol() {
         .join()
         .expect("fake notify socket reader thread must not panic");
 
-    let ready_count = lines
-        .iter()
-        .filter(|line| line.contains("READY=1"))
-        .count();
+    let ready_count = lines.iter().filter(|line| line.contains("READY=1")).count();
     assert_eq!(
         ready_count, 1,
         "READY=1 must be sent exactly once (AC-SD-1); captured: {lines:?}; exit={exit_status:?}"

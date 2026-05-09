@@ -50,11 +50,7 @@ pub fn notify_watchdog() -> Result<(), crate::error::Error> {
 /// enabled). Returns half the configured interval so pings arrive well before
 /// the deadline. Returns `None` if the variable is absent or unparseable.
 pub fn watchdog_interval() -> Option<Duration> {
-    let usec: u64 = std::env::var("WATCHDOG_USEC")
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
+    let usec: u64 = std::env::var("WATCHDOG_USEC").ok()?.trim().parse().ok()?;
     Some(Duration::from_micros(usec / 2))
 }
 

@@ -420,8 +420,6 @@ impl<'r, 'a, M: GuestMemory> TxProcessor<'r, 'a, M> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use ip_network::Ipv4Network;
     use mac_address::MacAddress;
     use tempfile::TempDir;
@@ -429,6 +427,7 @@ mod tests {
     use vm_memory::{GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryMmap};
     use x25519_dalek::StaticSecret;
 
+    use super::*;
     use crate::config::{Dhcp, DhcpPool, Network, Vm, Wireguard};
     use crate::wire::eth::build_eth_frame;
 
@@ -472,10 +471,16 @@ mod tests {
             .unwrap();
         mem.write_slice(&len.to_le_bytes(), GuestAddress(DESC_TABLE_ADDR + off + 8))
             .unwrap();
-        mem.write_slice(&flags.to_le_bytes(), GuestAddress(DESC_TABLE_ADDR + off + 12))
-            .unwrap();
-        mem.write_slice(&next.to_le_bytes(), GuestAddress(DESC_TABLE_ADDR + off + 14))
-            .unwrap();
+        mem.write_slice(
+            &flags.to_le_bytes(),
+            GuestAddress(DESC_TABLE_ADDR + off + 12),
+        )
+        .unwrap();
+        mem.write_slice(
+            &next.to_le_bytes(),
+            GuestAddress(DESC_TABLE_ADDR + off + 14),
+        )
+        .unwrap();
     }
 
     /// Append a chain head index to the avail ring at slot `slot`, then
@@ -488,11 +493,8 @@ mod tests {
         )
         .unwrap();
         // avail.idx is at avail_ring + 2 (after flags).
-        mem.write_slice(
-            &total_idx.to_le_bytes(),
-            GuestAddress(AVAIL_RING_ADDR + 2),
-        )
-        .unwrap();
+        mem.write_slice(&total_idx.to_le_bytes(), GuestAddress(AVAIL_RING_ADDR + 2))
+            .unwrap();
     }
 
     fn make_intercept_cfg() -> InterceptCfg {
@@ -664,8 +666,7 @@ mod tests {
         let mut wg = make_wg_engine();
 
         // Set up a separate (unused) RX vring; flush is never invoked here.
-        let rx_gmm =
-            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let rx_gmm = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let rx_atomic = GuestMemoryAtomic::new(rx_gmm);
         let rx_vring = VringRwLock::new(rx_atomic.clone(), QUEUE_SIZE).unwrap();
         rx_vring.set_queue_size(QUEUE_SIZE);
@@ -725,8 +726,7 @@ mod tests {
         let mut dhcp = make_dhcp(&dir);
         let mut wg = make_wg_engine();
 
-        let rx_gmm =
-            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let rx_gmm = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let rx_atomic = GuestMemoryAtomic::new(rx_gmm);
         let rx_vring = VringRwLock::new(rx_atomic.clone(), QUEUE_SIZE).unwrap();
         rx_vring.set_queue_size(QUEUE_SIZE);

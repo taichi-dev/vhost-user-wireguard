@@ -93,10 +93,8 @@ pub fn classify(
     }
     let max_frame_len = usize::from(cfg.vm_mtu) + ETH_HEADER_LEN;
     if frame.len() > max_frame_len {
-        let icmp_ipv4 =
-            build_icmp_frag_needed(&frame[ETH_HEADER_LEN..], cfg.vm_mtu, gateway_ip);
-        let icmp_eth =
-            build_eth_frame(cfg.vm_mac, cfg.gateway_mac, ETHERTYPE_IPV4, &icmp_ipv4);
+        let icmp_ipv4 = build_icmp_frag_needed(&frame[ETH_HEADER_LEN..], cfg.vm_mtu, gateway_ip);
+        let icmp_eth = build_eth_frame(cfg.vm_mac, cfg.gateway_mac, ETHERTYPE_IPV4, &icmp_ipv4);
         return InterceptDecision::IcmpFragNeeded(icmp_eth);
     }
 
@@ -117,8 +115,7 @@ pub fn classify(
     match ethertype {
         ETHERTYPE_IPV4 => {}
         ETHERTYPE_ARP => {
-            return match handle_arp_request(frame, cfg.gateway_ip, cfg.gateway_mac, cfg.vm_mac)
-            {
+            return match handle_arp_request(frame, cfg.gateway_ip, cfg.gateway_mac, cfg.vm_mac) {
                 Some(reply) => InterceptDecision::ArpReply(reply),
                 None => InterceptDecision::Drop(DropReason::EthTypeFiltered(ETHERTYPE_ARP)),
             };
@@ -180,14 +177,13 @@ pub fn classify(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::time::UNIX_EPOCH;
 
     use ip_network::Ipv4Network;
     use mac_address::MacAddress;
     use tempfile::TempDir;
 
+    use super::*;
     use crate::config::{Dhcp, DhcpPool, Network, Vm};
 
     const VM_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
@@ -254,11 +250,7 @@ mod tests {
         bytes
     }
 
-    fn build_arp_request(
-        sender_mac: [u8; 6],
-        sender_ip: Ipv4Addr,
-        target_ip: Ipv4Addr,
-    ) -> Vec<u8> {
+    fn build_arp_request(sender_mac: [u8; 6], sender_ip: Ipv4Addr, target_ip: Ipv4Addr) -> Vec<u8> {
         let mut arp = vec![0u8; 28];
         arp[0..2].copy_from_slice(&1u16.to_be_bytes()); // htype = Ethernet
         arp[2..4].copy_from_slice(&0x0800u16.to_be_bytes()); // ptype = IPv4
@@ -273,8 +265,7 @@ mod tests {
 
     fn build_dhcp_discover(vm_mac: [u8; 6]) -> Vec<u8> {
         use dhcproto::v4::{
-            DhcpOption, DhcpOptions, Encodable, Encoder, Flags, HType, Message, MessageType,
-            Opcode,
+            DhcpOption, DhcpOptions, Encodable, Encoder, Flags, HType, Message, MessageType, Opcode,
         };
 
         let mut opts = DhcpOptions::default();
@@ -301,7 +292,14 @@ mod tests {
         udp.extend_from_slice(&[0, 0]); // checksum (skipped)
         udp.extend_from_slice(&dhcp_buf);
 
-        let ipv4 = build_ipv4(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, 17, &udp, false, 0);
+        let ipv4 = build_ipv4(
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            17,
+            &udp,
+            false,
+            0,
+        );
         build_eth_frame([0xff; 6], vm_mac, 0x0800, &ipv4)
     }
 
@@ -331,7 +329,15 @@ mod tests {
         let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), 17, &body, false, 0);
         let frame = build_eth_frame(GW_MAC, VM_MAC, 0x0800, &ipv4);
         assert!(frame.len() > usize::from(cfg.vm_mtu) + 14);
-        let result = classify(&frame, &cfg, Some(VM_IP), &route, UNIX_EPOCH, &mut dhcp, GW_IP);
+        let result = classify(
+            &frame,
+            &cfg,
+            Some(VM_IP),
+            &route,
+            UNIX_EPOCH,
+            &mut dhcp,
+            GW_IP,
+        );
         match result {
             InterceptDecision::IcmpFragNeeded(reply) => {
                 // Must be at least an Ethernet header + IPv4 header + ICMP header.
@@ -354,7 +360,15 @@ mod tests {
         let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), 6, &[0u8; 4], false, 0);
         let wrong_mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01];
         let frame = build_eth_frame(GW_MAC, wrong_mac, 0x0800, &ipv4);
-        let result = classify(&frame, &cfg, Some(VM_IP), &route, UNIX_EPOCH, &mut dhcp, GW_IP);
+        let result = classify(
+            &frame,
+            &cfg,
+            Some(VM_IP),
+            &route,
+            UNIX_EPOCH,
+            &mut dhcp,
+            GW_IP,
+        );
         assert!(matches!(
             result,
             InterceptDecision::Drop(DropReason::SrcMacSpoofed)
@@ -397,7 +411,15 @@ mod tests {
         let mut dhcp = make_dhcp_server(&dir);
         let arp = build_arp_request(VM_MAC, VM_IP, GW_IP);
         let frame = build_eth_frame([0xff; 6], VM_MAC, 0x0806, &arp);
-        let result = classify(&frame, &cfg, Some(VM_IP), &route, UNIX_EPOCH, &mut dhcp, GW_IP);
+        let result = classify(
+            &frame,
+            &cfg,
+            Some(VM_IP),
+            &route,
+            UNIX_EPOCH,
+            &mut dhcp,
+            GW_IP,
+        );
         match result {
             InterceptDecision::ArpReply(reply) => {
                 assert!(reply.len() >= 14 + 28);
@@ -443,7 +465,15 @@ mod tests {
             0,
         );
         let frame = build_eth_frame(GW_MAC, VM_MAC, 0x0800, &ipv4);
-        let result = classify(&frame, &cfg, Some(VM_IP), &route, UNIX_EPOCH, &mut dhcp, GW_IP);
+        let result = classify(
+            &frame,
+            &cfg,
+            Some(VM_IP),
+            &route,
+            UNIX_EPOCH,
+            &mut dhcp,
+            GW_IP,
+        );
         assert!(matches!(
             result,
             InterceptDecision::Drop(DropReason::SrcIpSpoofed)
@@ -458,7 +488,15 @@ mod tests {
         let mut dhcp = make_dhcp_server(&dir);
         let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), 6, &[0u8; 4], false, 0);
         let frame = build_eth_frame(GW_MAC, VM_MAC, 0x0800, &ipv4);
-        let result = classify(&frame, &cfg, Some(VM_IP), &route, UNIX_EPOCH, &mut dhcp, GW_IP);
+        let result = classify(
+            &frame,
+            &cfg,
+            Some(VM_IP),
+            &route,
+            UNIX_EPOCH,
+            &mut dhcp,
+            GW_IP,
+        );
         assert!(matches!(
             result,
             InterceptDecision::Drop(DropReason::NoRoute)
@@ -475,9 +513,20 @@ mod tests {
         let mut dhcp = make_dhcp_server(&dir);
         let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), 6, &[0u8; 4], false, 0);
         let frame = build_eth_frame(GW_MAC, VM_MAC, 0x0800, &ipv4);
-        let result = classify(&frame, &cfg, Some(VM_IP), &route, UNIX_EPOCH, &mut dhcp, GW_IP);
+        let result = classify(
+            &frame,
+            &cfg,
+            Some(VM_IP),
+            &route,
+            UNIX_EPOCH,
+            &mut dhcp,
+            GW_IP,
+        );
         match result {
-            InterceptDecision::Tunnel { peer_idx, ip_packet } => {
+            InterceptDecision::Tunnel {
+                peer_idx,
+                ip_packet,
+            } => {
                 assert_eq!(peer_idx, 42);
                 assert_eq!(ip_packet, ipv4);
             }
@@ -494,7 +543,15 @@ mod tests {
         // MF flag set => packet is a non-final fragment.
         let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), 6, &[0u8; 4], true, 0);
         let frame = build_eth_frame(GW_MAC, VM_MAC, 0x0800, &ipv4);
-        let result = classify(&frame, &cfg, Some(VM_IP), &route, UNIX_EPOCH, &mut dhcp, GW_IP);
+        let result = classify(
+            &frame,
+            &cfg,
+            Some(VM_IP),
+            &route,
+            UNIX_EPOCH,
+            &mut dhcp,
+            GW_IP,
+        );
         assert!(matches!(
             result,
             InterceptDecision::Drop(DropReason::FragmentedPacket)

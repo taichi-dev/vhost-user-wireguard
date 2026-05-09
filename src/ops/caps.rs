@@ -9,7 +9,7 @@
 use std::fs;
 
 use caps::CapSet;
-use rustix::thread::{set_no_new_privs, set_thread_gid, set_thread_uid, Gid, Uid};
+use rustix::thread::{Gid, Uid, set_no_new_privs, set_thread_gid, set_thread_uid};
 
 use crate::error::PrivilegeError;
 
@@ -149,9 +149,6 @@ mod tests {
     fn test_drop_privileges_unknown_group() {
         let result = drop_privileges(None, Some("nonexistent_group_xyz"));
         assert!(result.is_err());
-        assert!(matches!(
-            result,
-            Err(PrivilegeError::UnknownGroup { .. })
-        ));
+        assert!(matches!(result, Err(PrivilegeError::UnknownGroup { .. })));
     }
 }

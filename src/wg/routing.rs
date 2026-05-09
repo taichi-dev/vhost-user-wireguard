@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::net::Ipv4Addr;
+
 use ip_network::IpNetwork;
 use ip_network_table::IpNetworkTable;
-use std::net::Ipv4Addr;
 
 pub struct AllowedIpsRouter {
     table: IpNetworkTable<usize>,

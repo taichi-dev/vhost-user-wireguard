@@ -3,8 +3,8 @@
 //! virtio_net_hdr_v1 serialization and deserialization helpers.
 
 use virtio_bindings::bindings::virtio_net::{
-    virtio_net_hdr_v1, virtio_net_hdr_v1__bindgen_ty_1,
-    virtio_net_hdr_v1__bindgen_ty_1__bindgen_ty_1, VIRTIO_NET_HDR_GSO_NONE,
+    VIRTIO_NET_HDR_GSO_NONE, virtio_net_hdr_v1, virtio_net_hdr_v1__bindgen_ty_1,
+    virtio_net_hdr_v1__bindgen_ty_1__bindgen_ty_1,
 };
 
 use crate::error::VhostError;

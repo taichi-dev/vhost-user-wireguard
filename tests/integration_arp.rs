@@ -27,15 +27,14 @@ mod common;
 
 use std::net::Ipv4Addr;
 
-use dhcproto::v4::{
-    DhcpOption, DhcpOptions, Flags, HType, Message, MessageType, Opcode, OptionCode,
-};
-use dhcproto::{Decodable as _, Decoder, Encodable as _, Encoder};
-
 use common::{
     GATEWAY_IP, GATEWAY_MAC, MockVhostUserMaster, VM_IP, VM_MAC, build_arp_request,
     build_dhcp_discover,
 };
+use dhcproto::v4::{
+    DhcpOption, DhcpOptions, Flags, HType, Message, MessageType, Opcode, OptionCode,
+};
+use dhcproto::{Decodable as _, Decoder, Encodable as _, Encoder};
 
 const ETHERTYPE_ARP: u16 = 0x0806;
 const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -178,8 +177,7 @@ fn test_gratuitous_arp_after_dhcp_ack() {
     );
     let yiaddr = offer.yiaddr();
 
-    let request =
-        build_dhcp_request_selecting(VM_MAC, GATEWAY_IP, yiaddr, offer.xid());
+    let request = build_dhcp_request_selecting(VM_MAC, GATEWAY_IP, yiaddr, offer.xid());
     master.write_tx_frame(&request);
     let ack_frame = master
         .read_rx_frame()
@@ -315,10 +313,7 @@ fn ipv4_header_checksum(header: &[u8]) -> u16 {
 /// reply. Panics on any malformed layer because the daemon must always
 /// emit RFC-compliant replies.
 fn parse_dhcp_reply(eth_frame: &[u8]) -> Message {
-    assert!(
-        eth_frame.len() >= 14,
-        "frame too short for Ethernet header"
-    );
+    assert!(eth_frame.len() >= 14, "frame too short for Ethernet header");
     assert_eq!(
         u16::from_be_bytes([eth_frame[12], eth_frame[13]]),
         ETHERTYPE_IPV4,

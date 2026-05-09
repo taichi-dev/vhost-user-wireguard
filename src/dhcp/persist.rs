@@ -188,11 +188,12 @@ impl LeaseFile {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::Ipv4Addr;
     use std::time::{Duration, UNIX_EPOCH};
+
     use tempfile::TempDir;
 
+    use super::*;
     use crate::dhcp::lease::{Lease, LeaseState};
 
     fn make_lease(mac_byte: u8, ip: Ipv4Addr) -> Lease {
@@ -265,11 +266,7 @@ mod tests {
         let corrupt_files: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains("corrupt")
-            })
+            .filter(|e| e.file_name().to_string_lossy().contains("corrupt"))
             .collect();
         assert!(!corrupt_files.is_empty(), "corrupt file should exist");
     }

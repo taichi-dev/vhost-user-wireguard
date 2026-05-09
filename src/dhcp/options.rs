@@ -134,8 +134,9 @@ pub fn build_inform_response(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use dhcproto::v4::{DhcpOption, MessageType, OptionCode};
+
+    use super::*;
 
     #[test]
     fn test_ack_has_lease_options() {

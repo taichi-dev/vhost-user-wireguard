@@ -141,10 +141,7 @@ impl Peer {
         datagram: &[u8],
         out: &mut [u8],
     ) -> DecapResult {
-        match self
-            .tunn
-            .decapsulate(Some(src_addr.ip()), datagram, out)
-        {
+        match self.tunn.decapsulate(Some(src_addr.ip()), datagram, out) {
             TunnResult::WriteToTunnelV4(packet, src_ip) => {
                 self.current_endpoint = src_addr;
                 self.last_decap_at = Some(Instant::now());
@@ -196,11 +193,13 @@ impl Peer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use boringtun::noise::rate_limiter::RateLimiter;
     use std::net::SocketAddr;
     use std::sync::Arc;
+
+    use boringtun::noise::rate_limiter::RateLimiter;
     use x25519_dalek::{PublicKey, StaticSecret};
+
+    use super::*;
 
     fn make_secret(byte: u8) -> StaticSecret {
         StaticSecret::from([byte; 32])
