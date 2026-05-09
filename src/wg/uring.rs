@@ -23,17 +23,15 @@ use socket2::SockAddr;
 
 use crate::error::WgError;
 
-const RECV_POOL_SIZE: usize = 32;
-const SEND_POOL_SIZE: usize = 64;
+const RECV_POOL_SIZE: usize = 64;
+const SEND_POOL_SIZE: usize = 256;
 const RECV_BUF_LEN: usize = 1500 + 32 + 16;
 const SEND_BUF_LEN: usize = 2048;
-const RING_ENTRIES: u32 = 256;
+const RING_ENTRIES: u32 = 1024;
 
 /// `user_data` discriminator: bit 63 distinguishes recv slot indices from
 /// send slot indices in the unified completion stream.
 const RECV_USER_DATA_TAG: u64 = 1u64 << 63;
-
-const SOCKET_FIXED_INDEX: u32 = 0;
 
 /// One pre-allocated recv slot. Buffer + msghdr + iovec + sockaddr_storage all
 /// live in stable heap allocations so the kernel can DMA into them via the raw
@@ -133,11 +131,13 @@ impl SendSlot {
 
 pub struct WgUring {
     ring: IoUring,
+    socket_fd: RawFd,
     eventfd: OwnedFd,
     recv_slots: Vec<RecvSlot>,
     send_slots: Vec<SendSlot>,
     send_free: Vec<usize>,
     recv_armed: bool,
+    pending_submit: bool,
 }
 
 // SAFETY: vhost-user-backend serializes all `WgNetBackend` access through a Mutex.
@@ -156,10 +156,6 @@ impl WgUring {
             .build(RING_ENTRIES)
             .map_err(uring_err)?;
 
-        ring.submitter()
-            .register_files(&[socket_fd])
-            .map_err(uring_err)?;
-
         let eventfd_raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         if eventfd_raw < 0 {
             return Err(WgError::SocketSend(io::Error::last_os_error()));
@@ -175,14 +171,15 @@ impl WgUring {
         let send_slots: Vec<SendSlot> = (0..SEND_POOL_SIZE).map(|_| SendSlot::new()).collect();
         let send_free: Vec<usize> = (0..SEND_POOL_SIZE).rev().collect();
 
-        let _ = socket_fd;
         let mut this = Self {
             ring,
+            socket_fd,
             eventfd,
             recv_slots,
             send_slots,
             send_free,
             recv_armed: false,
+            pending_submit: false,
         };
         this.arm_recvs()?;
         Ok(this)
@@ -215,6 +212,7 @@ impl WgUring {
         }
         self.recv_armed = true;
         self.ring.submit().map_err(uring_err)?;
+        self.pending_submit = false;
         Ok(())
     }
 
@@ -222,7 +220,7 @@ impl WgUring {
         let slot = &mut self.recv_slots[idx];
         slot.reset_for_resubmit();
         let msg_ptr: *mut libc::msghdr = &mut *slot.msg;
-        let entry = opcode::RecvMsg::new(types::Fixed(SOCKET_FIXED_INDEX), msg_ptr)
+        let entry = opcode::RecvMsg::new(types::Fd(self.socket_fd), msg_ptr)
             .build()
             .user_data(RECV_USER_DATA_TAG | idx as u64);
         // SAFETY: SQE references heap memory owned by `slot`; lifetime exceeds CQE.
@@ -232,6 +230,8 @@ impl WgUring {
                 WgError::SocketSend(io::Error::other("io_uring SQ full while arming recv"))
             })?;
         }
+        drop(sq);
+        self.pending_submit = true;
         Ok(())
     }
 
@@ -247,16 +247,19 @@ impl WgUring {
                 SEND_BUF_LEN
             ))));
         }
-        let slot_idx = match self.send_free.pop() {
-            Some(i) => i,
-            None => {
-                self.ring.submit().map_err(uring_err)?;
-                self.reap_completions(|_, _| {});
-                self.send_free.pop().ok_or_else(|| {
-                    WgError::SocketSend(io::Error::from(io::ErrorKind::WouldBlock))
-                })?
+        // If the send pool is exhausted, flush whatever's pending and ask the
+        // caller to back off — DO NOT try to drain CQEs inline. Recv CQEs in
+        // the same CQ would have to be dropped (we have no sink here), which
+        // would leak in-flight RecvMsgs and ultimately starve the recv path.
+        // The natural eventfd → epoll → handle_socket_burst path will reap
+        // send completions correctly on the next wake-up.
+        let slot_idx = self.send_free.pop().ok_or_else(|| {
+            if self.pending_submit {
+                let _ = self.ring.submit();
+                self.pending_submit = false;
             }
-        };
+            WgError::SocketSend(io::Error::from(io::ErrorKind::WouldBlock))
+        })?;
         let slot = &mut self.send_slots[slot_idx];
         slot.buf[..payload.len()].copy_from_slice(payload);
         let sock = SockAddr::from(addr);
@@ -273,32 +276,34 @@ impl WgUring {
         let buf_ptr = slot.buf.as_ptr();
         let addr_ptr = &*slot.addr as *const libc::sockaddr_storage as *const libc::sockaddr;
         let addr_len = slot.addr_len;
-        let entry = opcode::Send::new(
-            types::Fixed(SOCKET_FIXED_INDEX),
-            buf_ptr,
-            payload.len() as u32,
-        )
-        .dest_addr(addr_ptr)
-        .dest_addr_len(addr_len)
-        .build()
-        .user_data(slot_idx as u64);
+        let entry = opcode::Send::new(types::Fd(self.socket_fd), buf_ptr, payload.len() as u32)
+            .dest_addr(addr_ptr)
+            .dest_addr_len(addr_len)
+            .build()
+            .user_data(slot_idx as u64);
         // SAFETY: SQE references slot.buf and slot.addr; both live in stable Boxes.
         let mut sq = self.ring.submission();
         unsafe {
             if sq.push(&entry).is_err() {
                 drop(sq);
                 self.ring.submit().map_err(uring_err)?;
+                self.pending_submit = false;
                 let mut sq2 = self.ring.submission();
                 sq2.push(&entry).map_err(|_| {
                     WgError::SocketSend(io::Error::other("io_uring SQ full after flush"))
                 })?;
             }
         }
+        self.pending_submit = true;
         Ok(())
     }
 
     pub fn submit(&mut self) -> Result<(), WgError> {
+        if !self.pending_submit {
+            return Ok(());
+        }
         self.ring.submit().map_err(uring_err)?;
+        self.pending_submit = false;
         Ok(())
     }
 
@@ -349,28 +354,11 @@ impl WgUring {
         }
         if any_resubmit {
             self.ring.submit().map_err(uring_err)?;
+            self.pending_submit = false;
         }
         Ok(recvs)
     }
 
-    /// Drain completions without dispatching recvs (used to reap send CQEs in
-    /// tight loops to free pool slots).
-    fn reap_completions<F: FnMut(u64, i32)>(&mut self, mut sink: F) {
-        let pending: Vec<(u64, i32)> = {
-            let cq = self.ring.completion();
-            cq.map(|cqe| (cqe.user_data(), cqe.result())).collect()
-        };
-        for (user_data, result) in pending {
-            if user_data & RECV_USER_DATA_TAG == 0 {
-                let idx = user_data as usize;
-                if let Some(slot) = self.send_slots.get_mut(idx) {
-                    slot.in_flight = false;
-                    self.send_free.push(idx);
-                }
-            }
-            sink(user_data, result);
-        }
-    }
 }
 
 fn uring_err(e: io::Error) -> WgError {
@@ -407,9 +395,7 @@ mod tests {
         rustix::net::sockopt::set_ipv6_v6only(&owned, false).unwrap();
         let bind_addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
         rustix::net::bind(&owned, &bind_addr).unwrap();
-        let s = UdpSocket::from(owned);
-        s.set_nonblocking(true).unwrap();
-        s
+        UdpSocket::from(owned)
     }
 
     #[test]
@@ -461,5 +447,44 @@ mod tests {
             .unwrap();
         let (n, _) = receiver.recv_from(&mut buf).expect("recv");
         assert_eq!(&buf[..n], payload);
+    }
+
+    /// Regression test for the production wake-up path: register the
+    /// `WgUring` eventfd with a level-triggered epoll (mimicking the
+    /// vhost-user-backend framework) and confirm that the kernel writes
+    /// to the eventfd whenever a CQE arrives.
+    #[test]
+    fn test_eventfd_wakes_epoll_on_recv() {
+        let receiver = bind_v6_dual_stack();
+        let recv_port = receiver.local_addr().unwrap().port();
+        let sender = bind_v6_dual_stack();
+        let mut uring = WgUring::new(receiver.as_raw_fd()).expect("build");
+
+        let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        assert!(epoll_fd >= 0, "epoll_create1 failed");
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: 1,
+        };
+        let r = unsafe {
+            libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, uring.eventfd(), &mut ev)
+        };
+        assert_eq!(r, 0, "epoll_ctl(ADD) failed: {}", io::Error::last_os_error());
+
+        let dst: SocketAddr = format!("[::1]:{}", recv_port).parse().unwrap();
+        sender.send_to(b"wake-up", dst).expect("send");
+
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
+        let n =
+            unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), 4, 2000) };
+        assert!(n >= 1, "epoll_wait did not surface eventfd within 2s (n={})", n);
+
+        uring.drain_eventfd();
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let _ = uring.handle_completions(8, |_, buf| got.push(buf.to_vec()));
+        assert_eq!(got.len(), 1);
+        assert_eq!(&got[0], b"wake-up");
+
+        unsafe { libc::close(epoll_fd) };
     }
 }

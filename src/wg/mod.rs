@@ -90,7 +90,11 @@ impl WgEngine {
         ));
         rustix::net::bind(&owned_fd, &bind_addr).map_err(|e| bind_err(e.into()))?;
         let socket = UdpSocket::from(owned_fd);
-        socket.set_nonblocking(true).map_err(bind_err)?;
+        // Socket stays in BLOCKING mode: io_uring is the sole I/O path now and
+        // installs its own internal poll watch only when the socket can block.
+        // Marking it non-blocking would make every RecvMsg complete with
+        // -EAGAIN immediately and lose the poll-watch path, so packets that
+        // arrive later would never generate CQEs.
 
         let mut timer_fd = TimerFd::new().map_err(timerfd_err)?;
         timer_fd
@@ -158,6 +162,14 @@ impl WgEngine {
 
     pub fn timer_fd_raw(&self) -> RawFd {
         self.timer_fd.as_raw_fd()
+    }
+
+    /// Flush any io_uring SQEs queued by `handle_tx_ip_packet` /
+    /// `handle_timer_tick` / `drain_peer`. Called once per TX-vring drain
+    /// batch so the kernel sees all encrypted outbound packets in a single
+    /// `io_uring_enter` syscall instead of one syscall per packet.
+    pub fn submit_uring(&mut self) -> Result<(), WgError> {
+        self.uring.submit()
     }
 
     /// Drain a single completed recv from the io_uring CQ, dispatching it
@@ -345,7 +357,6 @@ impl WgEngine {
                 let endpoint = self.peers[peer_idx].current_endpoint;
                 self.uring.queue_send(&out[..len], endpoint)?;
                 self.drain_peer(peer_idx, &mut out)?;
-                self.uring.submit()?;
                 Ok(())
             }
             EncapResult::Done => Ok(()),
@@ -506,13 +517,11 @@ mod tests {
     }
 
     #[test]
-    fn test_socket_is_nonblocking() {
+    fn test_handle_socket_readable_returns_none_on_idle_ring() {
         let our_secret = make_secret(11);
         let cfg = one_peer_cfg();
         let mut engine = WgEngine::new(&cfg, &our_secret).expect("engine should build");
-        // No data ever sent → recv_from should immediately return WouldBlock,
-        // surfacing as Ok(None).
-        let r = engine.handle_socket_readable().expect("non-blocking recv");
+        let r = engine.handle_socket_readable().expect("idle ring");
         assert!(r.is_none(), "expected no datagram on fresh socket");
     }
 

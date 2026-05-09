@@ -310,6 +310,9 @@ impl WgNetBackend {
         self.rx_queue = rx.queue;
         tx_result?;
 
+        if let Err(error) = self.wg.submit_uring() {
+            tracing::warn!(error = %error, "wg_uring_submit_error");
+        }
         self.flush_rx(rx_vring)?;
         Ok(())
     }
