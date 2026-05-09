@@ -40,7 +40,7 @@ use std::time::SystemTime;
 
 use vhost_user_backend::{VringRwLock, VringT};
 use virtio_queue::{DescriptorChain, Error as VirtioQueueError, QueueOwnedT, QueueT};
-use vm_memory::{Bytes, GuestMemory};
+use vm_memory::{Bytes, GuestAddress, GuestMemory};
 
 use crate::datapath::intercept::{DropReason, InterceptCfg, InterceptDecision, classify};
 use crate::datapath::vnet;
@@ -55,6 +55,12 @@ const VNET_HDR_LEN: usize = 12;
 const IPV4_DST_OFFSET: usize = 16;
 /// Length of an IPv4 address in bytes.
 const IPV4_ADDR_LEN: usize = 4;
+/// Hard cap on descriptor chains we'll consume for a single RX frame under
+/// `VIRTIO_NET_F_MRG_RXBUF`. With a 1500-byte Ethernet payload and reasonable
+/// guest buffer sizing (e.g. 256B/chain) we'd never approach this; hitting it
+/// implies the guest is posting pathologically small descriptors and we drop
+/// the frame instead of looping unboundedly.
+const MAX_CHAINS_PER_FRAME: usize = 16;
 
 /// Per-vring atomic observability counters.
 ///
@@ -170,53 +176,6 @@ where
     Ok(buf)
 }
 
-/// Write `header` followed by `frame` into the writable side of `chain`.
-///
-/// Returns `Ok(Some(used_len))` on success (always `header.len() +
-/// frame.len()`), `Ok(None)` if the writable segments cannot accommodate
-/// the full payload (caller drops the frame and releases the chain), and
-/// `Err(VhostError)` for true memory-access faults.
-fn write_frame_to_chain<M>(
-    chain: DescriptorChain<M>,
-    header: &[u8],
-    frame: &[u8],
-) -> Result<Option<u32>, VhostError>
-where
-    M: Deref + Clone,
-    M::Target: GuestMemory,
-{
-    let mem_keeper = chain.clone();
-    let mem: &M::Target = mem_keeper.memory();
-
-    let mut payload = Vec::with_capacity(header.len() + frame.len());
-    payload.extend_from_slice(header);
-    payload.extend_from_slice(frame);
-
-    let mut payload_offset: usize = 0;
-    let mut bytes_written: usize = 0;
-    for desc in chain.writable() {
-        if payload_offset >= payload.len() {
-            break;
-        }
-        let desc_len = usize::try_from(desc.len())
-            .map_err(|_| VhostError::Vring("descriptor length exceeds usize".to_string()))?;
-        let chunk_len = (payload.len() - payload_offset).min(desc_len);
-        mem.write_slice(
-            &payload[payload_offset..payload_offset + chunk_len],
-            desc.addr(),
-        )
-        .map_err(|e| VhostError::GuestMemory(e.to_string()))?;
-        payload_offset += chunk_len;
-        bytes_written += chunk_len;
-    }
-    if payload_offset < payload.len() {
-        return Ok(None);
-    }
-    u32::try_from(bytes_written)
-        .map(Some)
-        .map_err(|_| VhostError::Vring("RX written length exceeds u32".to_string()))
-}
-
 /// RX-side processor: bounded pending queue + RX vring writer.
 ///
 /// `enqueue` pushes onto an internal `VecDeque`, evicting the oldest entry
@@ -261,13 +220,21 @@ impl<'a, M: GuestMemory> RxProcessor<'a, M> {
         self.queue.push_back(frame);
     }
 
-    /// Drain queued frames into the RX vring until either the queue is empty
-    /// or there are no available descriptor chains. Signals the guest exactly
-    /// once if at least one frame was delivered.
+    /// Drain queued frames into the RX vring under
+    /// [`VIRTIO_NET_F_MRG_RXBUF`](crate::datapath::WgNetBackend::features)
+    /// semantics: each frame may consume multiple descriptor chains, and the
+    /// `num_buffers` field of the leading vnet header reflects the actual
+    /// chain count.
+    ///
+    /// Stops cleanly (and leaves remaining frames pending) when:
+    ///   - the queue.ready bit was flipped mid-flight (GET_VRING_BASE race),
+    ///   - the avail ring has no more chains to give, or
+    ///   - a single frame would consume more than [`MAX_CHAINS_PER_FRAME`]
+    ///     chains (in which case we bump `rx_undersized_drops` and drop it).
+    ///
+    /// Signals the guest exactly once at the end if at least one frame was
+    /// delivered or dropped.
     pub fn flush(&mut self) -> Result<(), VhostError> {
-        // Pre-build the 12-byte virtio_net_hdr_v1 for every frame we deliver.
-        let header = vnet::serialize(&vnet::rx_header());
-
         let mut state = self.vring.get_mut();
         // Tolerate the well-known race between a queued kick in our epoll and
         // a GET_VRING_BASE on the protocol thread that flips queue.ready to
@@ -278,48 +245,119 @@ impl<'a, M: GuestMemory> RxProcessor<'a, M> {
             return Ok(());
         }
         let mut delivered = false;
-        while !self.queue.is_empty() {
-            let chain_opt = match state.get_queue_mut().iter(self.mem) {
-                Ok(mut iter) => iter.next(),
-                Err(VirtioQueueError::QueueNotReady) => return Ok(()),
-                Err(e) => return Err(VhostError::Vring(e.to_string())),
-            };
-            let Some(chain) = chain_opt else {
-                break;
-            };
-            let head_index = chain.head_index();
-            let Some(frame) = self.queue.pop_front() else {
-                // Defensive: invariant is queue.len() > 0 here. If we ever
-                // reach this branch we have already pulled a chain off the
-                // avail ring and must release it (with used_len = 0) rather
-                // than leak it.
-                state
-                    .add_used(head_index, 0)
-                    .map_err(|e| VhostError::Vring(e.to_string()))?;
-                break;
-            };
-            match write_frame_to_chain(chain, &header, &frame)? {
-                Some(used_len) => {
-                    state
-                        .add_used(head_index, used_len)
-                        .map_err(|e| VhostError::Vring(e.to_string()))?;
-                    self.counters.rx_frames.fetch_add(1, Ordering::Relaxed);
-                    delivered = true;
+
+        'frame: while let Some(frame) = self.queue.pop_front() {
+            let payload_len = VNET_HDR_LEN + frame.len();
+            // Per-chain (head_index, bytes_written_into_this_chain). Each entry
+            // here corresponds to one chain we've claimed off the avail ring
+            // and MUST add_used before we exit (with the actual byte count, or
+            // 0 on abort).
+            let mut chain_records: Vec<(u16, u32)> = Vec::with_capacity(2);
+            // Flat per-chunk (guest_addr, len) plan for the final write phase,
+            // ordered by (chain, descriptor) so a single linear walk over the
+            // payload writes correctly.
+            let mut chunks: Vec<(GuestAddress, usize)> = Vec::with_capacity(2);
+            let mut total_writable: usize = 0;
+
+            while total_writable < payload_len {
+                if chain_records.len() >= MAX_CHAINS_PER_FRAME {
+                    break;
                 }
-                None => {
-                    // Guest posted a too-short descriptor chain. Release the
-                    // chain back with used_len=0 (so the guest can recycle it),
-                    // drop the frame on the floor, bump the counter, keep going.
-                    state
-                        .add_used(head_index, 0)
-                        .map_err(|e| VhostError::Vring(e.to_string()))?;
-                    self.counters
-                        .rx_undersized_drops
-                        .fetch_add(1, Ordering::Relaxed);
-                    delivered = true;
+                let chain_opt = match state.get_queue_mut().iter(self.mem) {
+                    Ok(mut iter) => iter.next(),
+                    Err(VirtioQueueError::QueueNotReady) => {
+                        // Race: GET_VRING_BASE flipped ready=false mid-frame.
+                        // Release everything we claimed, push the frame back so
+                        // the next ring arm replays it.
+                        for &(head, _) in &chain_records {
+                            let _ = state.add_used(head, 0);
+                        }
+                        self.queue.push_front(frame);
+                        if delivered {
+                            state.signal_used_queue().map_err(VhostError::EventFd)?;
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => return Err(VhostError::Vring(e.to_string())),
+                };
+                let Some(chain) = chain_opt else {
+                    // No more chains right now. Release any partial chains we
+                    // claimed and stop draining; this frame waits for a future
+                    // kick when the guest reposts buffers.
+                    for &(head, _) in &chain_records {
+                        state
+                            .add_used(head, 0)
+                            .map_err(|e| VhostError::Vring(e.to_string()))?;
+                    }
+                    self.queue.push_front(frame);
+                    break 'frame;
+                };
+
+                let head_index = chain.head_index();
+                let mut chain_bytes: u32 = 0;
+                for desc in chain.writable() {
+                    if total_writable >= payload_len {
+                        break;
+                    }
+                    let desc_len = usize::try_from(desc.len()).map_err(|_| {
+                        VhostError::Vring("descriptor length exceeds usize".to_string())
+                    })?;
+                    let chunk_len = (payload_len - total_writable).min(desc_len);
+                    if chunk_len > 0 {
+                        chunks.push((desc.addr(), chunk_len));
+                        total_writable += chunk_len;
+                        chain_bytes = chain_bytes.saturating_add(chunk_len as u32);
+                    }
                 }
+                chain_records.push((head_index, chain_bytes));
             }
+
+            if total_writable < payload_len {
+                // Hit the chain cap with insufficient writable bytes. Pull the
+                // ripcord: release every claimed chain with used_len=0 so the
+                // guest recycles its descriptors, drop the frame, count it.
+                for &(head, _) in &chain_records {
+                    state
+                        .add_used(head, 0)
+                        .map_err(|e| VhostError::Vring(e.to_string()))?;
+                }
+                self.counters
+                    .rx_undersized_drops
+                    .fetch_add(1, Ordering::Relaxed);
+                delivered = true;
+                continue 'frame;
+            }
+
+            // Build the wire image of (vnet_hdr | frame) with num_buffers set
+            // to the actual chain count, then linearly write it into the
+            // pre-computed chunk plan.
+            let num_buffers = u16::try_from(chain_records.len())
+                .map_err(|_| VhostError::Vring("too many chains for one frame".to_string()))?;
+            let mut header = vnet::rx_header();
+            header.num_buffers = num_buffers;
+            let header_bytes = vnet::serialize(&header);
+
+            let mut payload = Vec::with_capacity(payload_len);
+            payload.extend_from_slice(&header_bytes);
+            payload.extend_from_slice(&frame);
+
+            let mut pos = 0usize;
+            for (addr, chunk_len) in &chunks {
+                self.mem
+                    .write_slice(&payload[pos..pos + chunk_len], *addr)
+                    .map_err(|e| VhostError::GuestMemory(e.to_string()))?;
+                pos += chunk_len;
+            }
+
+            for &(head, bytes) in &chain_records {
+                state
+                    .add_used(head, bytes)
+                    .map_err(|e| VhostError::Vring(e.to_string()))?;
+            }
+            self.counters.rx_frames.fetch_add(1, Ordering::Relaxed);
+            delivered = true;
         }
+
         if delivered {
             state.signal_used_queue().map_err(VhostError::EventFd)?;
         }
@@ -473,7 +511,7 @@ mod tests {
     const AVAIL_RING_ADDR: u64 = 0x2000;
     const USED_RING_ADDR: u64 = 0x3000;
     const BUFFER_BASE: u64 = 0x5000;
-    const QUEUE_SIZE: u16 = 8;
+    const QUEUE_SIZE: u16 = 32;
 
     /// Build a fresh memory region + a configured (but empty) VringRwLock.
     fn setup_vring() -> (GuestMemoryAtomic<GuestMemoryMmap>, VringRwLock) {
@@ -689,17 +727,16 @@ mod tests {
     }
 
     #[test]
-    fn test_rx_flush_drops_frame_when_descriptor_too_small() {
-        // Guest posts an RX descriptor too small for vnet_hdr (12B) + frame.
-        // Pre-fix this propagated VhostError::Vring up through handle_event
-        // and crashed the vring_worker thread; post-fix the frame is dropped,
-        // the descriptor chain is released with used_len=0, the counter is
-        // bumped, and flush returns Ok(()).
+    fn test_rx_flush_holds_frame_when_buffers_temporarily_insufficient() {
+        // Guest posts a single descriptor too small for vnet_hdr (12B) + frame
+        // and no more chains are available. Under MRG_RXBUF semantics the
+        // correct behavior is to release the partial chain with used_len=0
+        // (so the guest can reclaim it and post bigger ones) AND keep the
+        // frame in self.queue for the next kick — NOT to drop on the floor.
         let (atomic, vring) = setup_vring();
         let mem_handle = atomic.memory();
         let mem: &GuestMemoryMmap = &mem_handle;
 
-        // 16-byte writable buffer cannot hold 12B header + 40B frame.
         write_desc(mem, 0, BUFFER_BASE, 16, 0x2 /* WRITE */, 0);
         publish_avail(mem, 0, 0, 1);
 
@@ -708,7 +745,81 @@ mod tests {
         rx.enqueue(vec![0xab; 40]);
         rx.flush().unwrap();
 
-        assert!(rx.queue.is_empty(), "frame must be dropped, not retried");
+        assert_eq!(rx.queue.len(), 1, "frame must remain pending for retry");
+        assert_eq!(counters.rx_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.rx_undersized_drops.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_rx_flush_uses_multiple_chains_for_one_frame() {
+        // VIRTIO_NET_F_MRG_RXBUF: one frame split across multiple descriptor
+        // chains. Frame body = 1500B, vnet_hdr = 12B, total = 1512B. Two
+        // chains of 800B each give 1600B writable. Both must be consumed,
+        // num_buffers must be set to 2 in the first chain's vnet_hdr, and
+        // the payload bytes must land in the right places.
+        const BUF_A: u64 = BUFFER_BASE;
+        const BUF_B: u64 = BUFFER_BASE + 0x1000;
+        let (atomic, vring) = setup_vring();
+        let mem_handle = atomic.memory();
+        let mem: &GuestMemoryMmap = &mem_handle;
+
+        write_desc(mem, 0, BUF_A, 800, 0x2 /* WRITE */, 0);
+        write_desc(mem, 1, BUF_B, 800, 0x2 /* WRITE */, 0);
+        publish_avail(mem, 0, 0, 1);
+        publish_avail(mem, 1, 1, 2);
+
+        let counters = Counters::new();
+        let mut rx = RxProcessor::new(&vring, mem, 32, &counters);
+        let frame: Vec<u8> = (0..1500).map(|i| (i & 0xff) as u8).collect();
+        rx.enqueue(frame.clone());
+        rx.flush().unwrap();
+
+        assert!(rx.queue.is_empty());
+        assert_eq!(counters.rx_frames.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.rx_undersized_drops.load(Ordering::Relaxed), 0);
+
+        // First chain holds: vnet_hdr (12B) + first 788B of the frame.
+        // num_buffers must be 2 (bytes 10..12 of the header).
+        let mut chain_a = [0u8; 800];
+        mem.read_slice(&mut chain_a, GuestAddress(BUF_A)).unwrap();
+        assert_eq!(u16::from_le_bytes([chain_a[10], chain_a[11]]), 2);
+        assert_eq!(&chain_a[12..800], &frame[..788]);
+
+        // Second chain holds: remaining 712 bytes of the frame in its first
+        // 712 bytes; the trailing 88 bytes of the descriptor are untouched.
+        let mut chain_b = [0u8; 712];
+        mem.read_slice(&mut chain_b, GuestAddress(BUF_B)).unwrap();
+        assert_eq!(&chain_b[..], &frame[788..]);
+    }
+
+    #[test]
+    fn test_rx_flush_drops_frame_when_chain_cap_exceeded() {
+        // Pathological guest: posts MAX_CHAINS_PER_FRAME (16) one-byte
+        // descriptors. flush() must consume all 16, decide it cannot fit a
+        // 40-byte frame even with chaining, release every claimed chain with
+        // used_len=0, drop the frame, and bump rx_undersized_drops.
+        let (atomic, vring) = setup_vring();
+        let mem_handle = atomic.memory();
+        let mem: &GuestMemoryMmap = &mem_handle;
+
+        for i in 0..MAX_CHAINS_PER_FRAME as u16 {
+            write_desc(
+                mem,
+                i,
+                BUFFER_BASE + u64::from(i),
+                1,
+                0x2, /* WRITE */
+                0,
+            );
+            publish_avail(mem, i, i, i + 1);
+        }
+
+        let counters = Counters::new();
+        let mut rx = RxProcessor::new(&vring, mem, 32, &counters);
+        rx.enqueue(vec![0xab; 40]);
+        rx.flush().unwrap();
+
+        assert!(rx.queue.is_empty(), "frame must be dropped at the cap");
         assert_eq!(counters.rx_frames.load(Ordering::Relaxed), 0);
         assert_eq!(counters.rx_undersized_drops.load(Ordering::Relaxed), 1);
     }
