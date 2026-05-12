@@ -299,8 +299,9 @@ impl WgEngine {
         if let Some(&idx) = self.recv_idx_to_peer.get(&receiver_idx) {
             return Some(idx);
         }
-        // SAFETY: receiver_idx >> 8 is at most u32::MAX >> 8 = 16_777_215, fits in usize on all supported platforms
-        let hint = (receiver_idx >> 8) as usize;
+        // `receiver_idx >> 8` is at most 16_777_215, which fits in usize on all
+        // supported targets (we only build for 32- and 64-bit pointer widths).
+        let hint = usize::try_from(receiver_idx >> 8).ok()?;
         (hint < self.peers.len()).then_some(hint)
     }
 

@@ -683,7 +683,14 @@ pub fn run_serve_loop(
     let (wg_uring_eventfd, timer_fd, exit_fd) = {
         let backend_arc = daemon.get_epoll_handlers();
         let _ = backend_arc;
-        let b = backend.lock().unwrap();
+        // The backend mutex is only ever locked from this thread before the
+        // daemon starts (and the framework's epoll workers spawn) and from the
+        // framework's worker threads thereafter. A poisoned mutex here means
+        // an earlier panic in a worker thread; the daemon cannot recover, so
+        // surface it as a backend error and exit cleanly.
+        let b = backend
+            .lock()
+            .map_err(|e| Error::Vhost(VhostError::Backend(format!("backend mutex: {e}"))))?;
         (b.wg_uring_eventfd(), b.wg_timer_fd(), b.exit_fd())
     };
 

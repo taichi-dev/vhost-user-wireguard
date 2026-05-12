@@ -1,5 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// Integration tests use panic-on-failure as the natural assertion idiom;
+// suppress the production-only restriction lints.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::as_conversions
+)]
+
 //! Smoke tests that drive the real daemon binary through the vhost-user wire
 //! protocol. The mock master harness lives in `tests/common/mod.rs`.
 

@@ -1,5 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// This module is a thin wrapper over libc/io_uring ABIs: it deals in raw
+// pointers, sockaddr layouts, and ring slot indices. The integer casts
+// (`addr as *mut _`, `idx as u64`, `len as u32`, ...) are all required for
+// FFI and are individually justified with `// SAFETY:` comments inline.
+// `clippy::as_conversions` flags every `as` cast as suspect, but TryFrom is
+// not applicable to pointer casts and is needlessly noisy for the FFI
+// width-matching cases (e.g. `libc::socklen_t` <-> `usize`).
+#![allow(clippy::as_conversions)]
+
 //! io_uring-backed UDP I/O for the WireGuard datapath.
 //!
 //! Replaces per-datagram `recv_from` / `send_to` syscalls with a single
@@ -82,8 +91,7 @@ impl RecvSlot {
             libc::AF_INET => {
                 // SAFETY: kernel populated sockaddr_storage with AF_INET → sockaddr_in layout.
                 let sin = unsafe {
-                    &*(&*self.src_addr as *const libc::sockaddr_storage
-                        as *const libc::sockaddr_in)
+                    &*(&*self.src_addr as *const libc::sockaddr_storage as *const libc::sockaddr_in)
                 };
                 let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
                 let port = u16::from_be(sin.sin_port);
@@ -358,7 +366,6 @@ impl WgUring {
         }
         Ok(recvs)
     }
-
 }
 
 fn uring_err(e: io::Error) -> WgError {
@@ -466,18 +473,24 @@ mod tests {
             events: libc::EPOLLIN as u32,
             u64: 1,
         };
-        let r = unsafe {
-            libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, uring.eventfd(), &mut ev)
-        };
-        assert_eq!(r, 0, "epoll_ctl(ADD) failed: {}", io::Error::last_os_error());
+        let r = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, uring.eventfd(), &mut ev) };
+        assert_eq!(
+            r,
+            0,
+            "epoll_ctl(ADD) failed: {}",
+            io::Error::last_os_error()
+        );
 
         let dst: SocketAddr = format!("[::1]:{}", recv_port).parse().unwrap();
         sender.send_to(b"wake-up", dst).expect("send");
 
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
-        let n =
-            unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), 4, 2000) };
-        assert!(n >= 1, "epoll_wait did not surface eventfd within 2s (n={})", n);
+        let n = unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), 4, 2000) };
+        assert!(
+            n >= 1,
+            "epoll_wait did not surface eventfd within 2s (n={})",
+            n
+        );
 
         uring.drain_eventfd();
         let mut got: Vec<Vec<u8>> = Vec::new();

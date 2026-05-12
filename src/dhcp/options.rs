@@ -82,16 +82,16 @@ impl DhcpOptionsBuilder {
 
     /// Set option 121 — classless static routes (RFC 3442).
     pub fn with_classless_routes(mut self, routes: &[ClasslessRoute]) -> Self {
+        // `ip_network::Ipv4Network::netmask()` is always in 0..=32 and
+        // `Ipv4Net::new` only rejects prefix lengths above 32, so any route
+        // surviving this filter is guaranteed buildable. Skipping silently is
+        // strictly safer than panicking on an upstream invariant change.
         let encoded: Vec<(Ipv4Net, Ipv4Addr)> = routes
             .iter()
-            .map(|r| {
-                let prefix_len = r.prefix.netmask();
-                let net_addr = r.prefix.network_address();
-                // SAFETY: ip_network::Ipv4Network::netmask() returns 0..=32; Ipv4Net::new only
-                // fails if prefix_len > 32, which cannot happen here.
-                let ipnet = Ipv4Net::new(net_addr, prefix_len)
-                    .expect("ip_network prefix_len is always valid");
-                (ipnet, r.next_hop)
+            .filter_map(|r| {
+                Ipv4Net::new(r.prefix.network_address(), r.prefix.netmask())
+                    .ok()
+                    .map(|net| (net, r.next_hop))
             })
             .collect();
         self.opts.insert(DhcpOption::ClasslessStaticRoute(encoded));

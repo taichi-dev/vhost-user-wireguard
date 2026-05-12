@@ -1,5 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// virtio constants from `virtio_bindings` arrive as u32 from C but the
+// virtio_net_hdr_v1 fields they populate are u8. Each cast site is
+// statically known to fit (the affected constants are 0 or single-byte
+// flag values). Replacing every cast with `u8::try_from(...).unwrap()`
+// would itself violate `clippy::unwrap_used`, so allow `as_conversions`
+// at the module level.
+#![allow(clippy::as_conversions)]
+
 //! virtio_net_hdr_v1 serialization and deserialization helpers.
 
 use virtio_bindings::bindings::virtio_net::{

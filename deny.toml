@@ -6,9 +6,8 @@ allow = [
   "BSD-2-Clause",
   "BSD-3-Clause",
   "ISC",
-  "Unicode-DFS-2016",
-  "CC0-1.0",
-  "OpenSSL",
+  # Used by the ICU crates pulled in via dhcproto -> hickory-proto -> idna.
+  "Unicode-3.0",
 ]
 
 [bans]
@@ -17,9 +16,30 @@ multiple-versions = "warn"
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
+# cargo-deny 0.16+ removed per-kind severity ("warn"/"deny") strings; vulnerabilities
+# and yanked crates are always denied. `unmaintained` is now a scope filter.
+unmaintained = "workspace"
+
+ignore = [
+  # hickory-proto 0.25.2 (pulled in via dhcproto 0.14) carries two open
+  # advisories. Neither is reachable from this daemon:
+  #
+  # - RUSTSEC-2026-0118 is a DNSSEC NSEC3 validation bug. dhcproto depends on
+  #   hickory-proto with `default-features = false` and never enables the
+  #   `dnssec-ring` / `dnssec-aws-lc-rs` features, so the vulnerable
+  #   `DnssecDnsHandle` path is not compiled in.
+  # - RUSTSEC-2026-0119 is an O(n^2) name-compression DoS in hickory-proto's
+  #   `BinEncoder` triggered by attacker-controlled DNS messages. This daemon
+  #   only encodes DNS option fields built from administrator-supplied TOML
+  #   config (option 6 / option 15 / option 119), not from any guest input,
+  #   so an external actor cannot drive the encoder.
+  #
+  # Both fixes ship in hickory-proto >= 0.26.1 but dhcproto 0.14 (the latest
+  # release at time of writing) still pins ^0.25.2. Revisit when dhcproto
+  # publishes a release on the 0.26 line.
+  { id = "RUSTSEC-2026-0118", reason = "DNSSEC features not enabled in dhcproto -> hickory-proto" },
+  { id = "RUSTSEC-2026-0119", reason = "DNS encoder fed only admin-controlled config, no untrusted input path" },
+]
 
 [sources]
 unknown-registry = "warn"

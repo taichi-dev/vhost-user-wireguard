@@ -1,5 +1,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// CI runs `cargo clippy --all-targets` with `-D clippy::unwrap_used
+// -D clippy::expect_used -D clippy::panic -D clippy::as_conversions`. These
+// restriction lints are useful in production paths but are routine in test
+// code (setup/assert/teardown) where panic-on-failure is the expected
+// behaviour. Allow them in the test build only.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::as_conversions
+    )
+)]
+
 //! Library entry point for the vhost-user-wireguard daemon.
 //!
 //! [`run`] is the top-level orchestration that loads the configuration,

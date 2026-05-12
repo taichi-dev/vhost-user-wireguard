@@ -295,8 +295,8 @@ impl DhcpServer {
             .udp(DHCP_SERVER_PORT, DHCP_CLIENT_PORT);
         let mut frame = Vec::with_capacity(builder.size(dhcp_buf.len()));
         builder
-            .write(&mut frame, &dhcp_buf)
-            .expect("PacketBuilder write to Vec is infallible for in-range payloads");
+            .write_to_vec(&mut frame, &dhcp_buf)
+            .map_err(|e| DhcpError::FrameBuild(e.to_string()))?;
         Ok(frame)
     }
 

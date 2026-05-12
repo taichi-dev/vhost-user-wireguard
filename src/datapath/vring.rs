@@ -303,7 +303,12 @@ impl<'a, M: GuestMemory> RxProcessor<'a, M> {
                     if chunk_len > 0 {
                         chunks.push((desc.addr(), chunk_len));
                         total_writable += chunk_len;
-                        chain_bytes = chain_bytes.saturating_add(chunk_len as u32);
+                        // chunk_len is bounded above by `desc_len` (a virtqueue
+                        // descriptor length is u32 in the spec), so the
+                        // saturating widen is exact. Use TryFrom to keep clippy
+                        // happy about the conversion.
+                        let chunk_u32 = u32::try_from(chunk_len).unwrap_or(u32::MAX);
+                        chain_bytes = chain_bytes.saturating_add(chunk_u32);
                     }
                 }
                 chain_records.push((head_index, chain_bytes));

@@ -1,5 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// Integration tests use panic-on-failure as the natural assertion idiom;
+// suppress the production-only restriction lints.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::as_conversions
+)]
+
 //! End-to-end security integration tests against the real daemon binary.
 //!
 //! Each test owns a fresh [`MockVhostUserMaster`]: its own work tempdir, its

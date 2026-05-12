@@ -125,6 +125,9 @@ pub enum DhcpError {
         ip: std::net::Ipv4Addr,
         subnet: String,
     },
+
+    #[error("failed to build DHCP reply frame: {0}")]
+    FrameBuild(String),
 }
 
 /// Privilege dropping errors.

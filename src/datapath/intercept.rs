@@ -197,9 +197,12 @@ fn build_frag_needed_reply(
             },
         ));
     let mut buf = Vec::with_capacity(builder.size(icmp_data.len()));
-    builder
-        .write(&mut buf, &icmp_data)
-        .expect("PacketBuilder write to Vec is infallible for in-range payloads");
+    // `PacketBuilder::write` into a `Vec<u8>` cannot fail for in-range payloads
+    // (vector growth is the only I/O sink). Treat any unexpected error as a
+    // soft drop — the caller already tolerates an empty reply.
+    if builder.write(&mut buf, &icmp_data).is_err() {
+        return Vec::new();
+    }
     buf
 }
 
@@ -357,7 +360,14 @@ mod tests {
         // 9000-byte frame with a valid IPv4 header so build_frag_needed_reply
         // has a packet to reflect.
         let body = vec![0u8; 9000 - 14 - 20];
-        let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), IpNumber::UDP, &body, false, 0);
+        let ipv4 = build_ipv4(
+            VM_IP,
+            Ipv4Addr::new(8, 8, 8, 8),
+            IpNumber::UDP,
+            &body,
+            false,
+            0,
+        );
         let frame = build_eth_frame(GW_MAC, VM_MAC, EtherType::IPV4, &ipv4);
         assert!(frame.len() > usize::from(cfg.vm_mtu) + ETH_HEADER_LEN);
         let result = classify(
@@ -386,7 +396,14 @@ mod tests {
         let route = AllowedIpsRouter::new();
         let dir = TempDir::new().unwrap();
         let mut dhcp = make_dhcp_server(&dir);
-        let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), IpNumber::TCP, &[0u8; 4], false, 0);
+        let ipv4 = build_ipv4(
+            VM_IP,
+            Ipv4Addr::new(8, 8, 8, 8),
+            IpNumber::TCP,
+            &[0u8; 4],
+            false,
+            0,
+        );
         let wrong_mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01];
         let frame = build_eth_frame(GW_MAC, wrong_mac, EtherType::IPV4, &ipv4);
         let result = classify(
@@ -514,7 +531,14 @@ mod tests {
         let route = AllowedIpsRouter::new();
         let dir = TempDir::new().unwrap();
         let mut dhcp = make_dhcp_server(&dir);
-        let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), IpNumber::TCP, &[0u8; 4], false, 0);
+        let ipv4 = build_ipv4(
+            VM_IP,
+            Ipv4Addr::new(8, 8, 8, 8),
+            IpNumber::TCP,
+            &[0u8; 4],
+            false,
+            0,
+        );
         let frame = build_eth_frame(GW_MAC, VM_MAC, EtherType::IPV4, &ipv4);
         let result = classify(
             &frame,
@@ -539,7 +563,14 @@ mod tests {
         route.insert(net, 42);
         let dir = TempDir::new().unwrap();
         let mut dhcp = make_dhcp_server(&dir);
-        let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), IpNumber::TCP, &[0u8; 4], false, 0);
+        let ipv4 = build_ipv4(
+            VM_IP,
+            Ipv4Addr::new(8, 8, 8, 8),
+            IpNumber::TCP,
+            &[0u8; 4],
+            false,
+            0,
+        );
         let frame = build_eth_frame(GW_MAC, VM_MAC, EtherType::IPV4, &ipv4);
         let result = classify(
             &frame,
@@ -569,7 +600,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut dhcp = make_dhcp_server(&dir);
         // MF flag set => packet is a non-final fragment.
-        let ipv4 = build_ipv4(VM_IP, Ipv4Addr::new(8, 8, 8, 8), IpNumber::TCP, &[0u8; 4], true, 0);
+        let ipv4 = build_ipv4(
+            VM_IP,
+            Ipv4Addr::new(8, 8, 8, 8),
+            IpNumber::TCP,
+            &[0u8; 4],
+            true,
+            0,
+        );
         let frame = build_eth_frame(GW_MAC, VM_MAC, EtherType::IPV4, &ipv4);
         let result = classify(
             &frame,

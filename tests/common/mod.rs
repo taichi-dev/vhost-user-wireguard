@@ -1,5 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// Integration test harness: panic-on-failure is the natural assertion idiom.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::as_conversions
+)]
+
 //! Mock vhost-user master test harness.
 //!
 //! [`MockVhostUserMaster`] drives a child instance of the

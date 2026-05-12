@@ -36,26 +36,22 @@ pub fn load_preshared_key(path: &Path) -> Result<[u8; 32], WgError> {
 /// Parse a WireGuard private key from a base64-encoded string.
 pub fn parse_private_key_base64(s: &str) -> Result<x25519_dalek::StaticSecret, WgError> {
     let bytes = STANDARD.decode(s.trim())?;
-    if bytes.len() != 32 {
-        return Err(WgError::KeyLength {
-            length: bytes.len(),
-        });
-    }
-    // SAFETY: bytes.len() == 32 is verified by the check above; try_into cannot fail
-    let arr: [u8; 32] = bytes.try_into().expect("length checked above");
+    let length = bytes.len();
+    // `try_into` for `Vec<u8> -> [u8; 32]` only succeeds when length == 32, so
+    // surface the size mismatch as `WgError::KeyLength` rather than panicking.
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| WgError::KeyLength { length })?;
     Ok(x25519_dalek::StaticSecret::from(arr))
 }
 
 /// Parse a WireGuard preshared key from a base64-encoded string.
 pub fn parse_preshared_key_base64(s: &str) -> Result<[u8; 32], WgError> {
     let bytes = STANDARD.decode(s.trim())?;
-    if bytes.len() != 32 {
-        return Err(WgError::KeyLength {
-            length: bytes.len(),
-        });
-    }
-    // SAFETY: bytes.len() == 32 is verified by the check above; try_into cannot fail
-    let arr: [u8; 32] = bytes.try_into().expect("length checked above");
+    let length = bytes.len();
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| WgError::KeyLength { length })?;
     Ok(arr)
 }
 
@@ -71,8 +67,9 @@ fn check_key_file_mode(path: &Path) -> Result<(), WgError> {
         path: path.to_owned(),
         source: std::io::Error::from_raw_os_error(e.raw_os_error()),
     })?;
-    // SAFETY: st_mode is a POSIX mode_t (u32 on Linux); cast is lossless
-    let mode = stat.st_mode as u32;
+    // rustix exposes st_mode as u32 on both backends (libc + linux_raw), so no
+    // conversion is required.
+    let mode = stat.st_mode;
     if mode & 0o077 != 0 {
         return Err(WgError::KeyFileMode {
             path: path.to_owned(),

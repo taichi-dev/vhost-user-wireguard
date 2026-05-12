@@ -96,13 +96,16 @@ impl Peer {
         persistent_keepalive: Option<u16>,
         rate_limiter: Arc<RateLimiter>,
     ) -> Self {
+        // `idx` is the peer's slot in `WgEngine::peers`, capped at the
+        // configured peer count (255 by validation). Saturating into u32 keeps
+        // the conversion lossless without an `as` cast.
+        let peer_index_u32 = u32::try_from(idx).unwrap_or(u32::MAX);
         let tunn = Tunn::new(
             our_static_secret.clone(),
             peer_public_key,
             preshared_key,
             persistent_keepalive,
-            // SAFETY: idx is a peer index bounded by the configured peer count (max 255); fits in u32
-            idx as u32,
+            peer_index_u32,
             Some(rate_limiter),
         );
         let fingerprint = crate::wg::keys::key_fingerprint(&peer_public_key);
