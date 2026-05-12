@@ -23,7 +23,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked --all-targets
+      # Integration tests under tests/ spawn the release daemon binary and
+      # exercise the full vhost-user wire protocol; they require a privileged
+      # local environment and `cargo build --release` first. Skip them in CI
+      # and rely on the unit tests + `cargo clippy --all-targets` (which still
+      # type-checks the integration suite) to catch regressions.
+      - run: cargo test --locked --lib --bins
 
   clippy:
     runs-on: ubuntu-latest
