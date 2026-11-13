@@ -27,8 +27,14 @@
 #
 # We act on:
 #   prepare/begin  - before QEMU is forked: extract config, start daemon,
-#                    chmod socket so libvirt-qemu can connect.
+#                    chmod socket so libvirt-qemu can connect (server mode).
+#   started/*      - client mode only: QEMU has bound the socket, chown/chmod
+#                    it so the daemon (vhost-user-wg) can connect to it.
 #   release/end    - after QEMU has exited: stop daemon, remove config.
+#
+# Socket direction comes from `[vhost_user] mode` in the config: `server`
+# (default) means we bind the socket and QEMU connects; `client` means QEMU
+# binds it (`<source type='unix' mode='server'/>`) and the daemon connects.
 #
 # Domains that have no <vuwg:config> are silently ignored (exit 0).
 
@@ -138,9 +144,61 @@ def systemctl(action: str, unit: str) -> int:
     ).returncode
 
 
-def domain_socket_from_config(domain: str) -> Path:
-    """Default convention: /run/vhost-user-wg/<domain>.sock."""
+def socket_from_toml(toml_text: str, domain: str) -> Path:
+    """`[vhost_user] socket` from the config, falling back to the convention.
+
+    The convention (`/run/vhost-user-wg/<domain>.sock`) only holds for the
+    stock layout; client mode in particular usually points the socket at a
+    directory the *frontend* may write to, so the path must come from the
+    config rather than be guessed.
+    """
+    in_vhost_user = False
+    for line in toml_text.splitlines():
+        stripped = line.split("#", 1)[0].strip()
+        if stripped.startswith("["):
+            in_vhost_user = stripped == "[vhost_user]"
+            continue
+        if in_vhost_user and stripped.startswith("socket") and "=" in stripped:
+            _, _, value = stripped.partition("=")
+            path = value.strip().strip('"').strip("'")
+            if path:
+                return Path(path)
     return RUNTIME_DIR / f"{domain}.sock"
+
+
+def detect_client_mode(toml_text: str) -> bool:
+    """True when `[vhost_user] mode = "client"` (frontend binds the socket)."""
+    for line in toml_text.splitlines():
+        stripped = line.split("#", 1)[0].strip()
+        if stripped.startswith("mode") and "=" in stripped:
+            _, _, value = stripped.partition("=")
+            if value.strip().strip('"\'').lower() == "client":
+                return True
+    return False
+
+
+def chmod_socket_for_daemon(sock_path: Path) -> None:
+    """Client mode: QEMU owns the socket, so grant the daemon access to it.
+
+    The daemon (vhost-user-wg) must be able to connect, which needs write
+    permission on the socket; QEMU creates it as libvirt-qemu with its own
+    group. Mirror `chmod_socket_for_qemu`: chown to the daemon's user/group,
+    0660, falling back to 0666 when that fails.
+
+    Best effort by design: failing to adjust permissions must never abort a VM
+    start (the daemon may already be allowed in through group membership).
+    """
+    try:
+        shutil.chown(sock_path, user=DAEMON_USER, group=DAEMON_USER)
+        sock_path.chmod(0o660)
+        log(f"chown {DAEMON_USER} + chmod 0660 on {sock_path}")
+        return
+    except (KeyError, LookupError, OSError) as exc:
+        log(f"chown {DAEMON_USER} {sock_path} failed ({exc}); falling back to 0666")
+    try:
+        sock_path.chmod(0o666)
+    except OSError as exc:
+        log(f"chmod 0666 {sock_path} failed ({exc})")
 
 
 def handle_prepare(domain: str) -> int:
@@ -148,6 +206,8 @@ def handle_prepare(domain: str) -> int:
     toml_text = extract_toml(xml_text)
     if toml_text is None:
         return 0  # not a vuwg-managed domain
+
+    client_mode = detect_client_mode(toml_text)
 
     # /run/vhost-user-wg/ may not exist yet on first VM start after boot
     # (no service has run yet). Create it ourselves so we can write the
@@ -167,21 +227,53 @@ def handle_prepare(domain: str) -> int:
         log(f"systemctl start {unit} failed (rc={rc})")
         return 1
 
-    sock = domain_socket_from_config(domain)
-    deadline = time.monotonic() + SOCKET_WAIT_SECS
-    while time.monotonic() < deadline:
-        try:
-            if stat.S_ISSOCK(sock.stat().st_mode):
-                chmod_socket_for_qemu(sock)
-                log(f"daemon ready: {unit} listening on {sock}")
-                return 0
-        except FileNotFoundError:
-            pass
-        time.sleep(SOCKET_POLL_INTERVAL)
+    if client_mode:
+        # The frontend binds the socket once QEMU runs, so there is nothing to
+        # wait for here: the daemon retries until it appears. Permissions are
+        # fixed from the `started` hook, after QEMU created the socket.
+        sock = socket_from_toml(toml_text, domain)
+        log(f"client mode: {unit} started, waiting for {sock}")
+        return 0
+
+    sock = socket_from_toml(toml_text, domain)
+    if wait_for_socket(sock):
+        chmod_socket_for_qemu(sock)
+        log(f"daemon ready: {unit} listening on {sock}")
+        return 0
 
     log(f"timeout waiting for {sock} after {SOCKET_WAIT_SECS}s")
     systemctl("stop", unit)
     return 1
+
+
+def handle_started(domain: str) -> int:
+    """Client mode only: QEMU has created the socket, let the daemon in."""
+    config_path = RUNTIME_DIR / f"{domain}.toml"
+    try:
+        toml_text = config_path.read_text()
+    except FileNotFoundError:
+        return 0  # not ours
+    if not detect_client_mode(toml_text):
+        return 0
+
+    sock = socket_from_toml(toml_text, domain)
+    if not wait_for_socket(sock):
+        log(f"client mode: {sock} still missing {SOCKET_WAIT_SECS}s after VM start")
+        return 0
+    chmod_socket_for_daemon(sock)
+    return 0
+
+
+def wait_for_socket(sock: Path) -> bool:
+    deadline = time.monotonic() + SOCKET_WAIT_SECS
+    while time.monotonic() < deadline:
+        try:
+            if stat.S_ISSOCK(sock.stat().st_mode):
+                return True
+        except FileNotFoundError:
+            pass
+        time.sleep(SOCKET_POLL_INTERVAL)
+    return False
 
 
 def handle_release(domain: str) -> int:
@@ -206,6 +298,13 @@ def main() -> int:
 
     if event == "prepare" and phase == "begin":
         return handle_prepare(domain)
+    if event == "started":
+        # Never fail a VM start over a permission tweak.
+        try:
+            return handle_started(domain)
+        except Exception as exc:  # noqa: BLE001 - hook must not abort libvirt
+            log(f"client mode: post-start hook failed ({exc}); VM start unaffected")
+            return 0
     if event == "release" and phase == "end":
         return handle_release(domain)
     return 0

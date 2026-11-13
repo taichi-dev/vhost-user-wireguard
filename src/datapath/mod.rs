@@ -14,11 +14,12 @@
 //! | `EXTRA_TOKEN_TIMER`(4)| WG 1 Hz timerfd                  | tick peer timers, checkpoint    |
 //! | `EXTRA_TOKEN_EXIT` (5)| externally registered shutdown fd| break the serve loop with `Err` |
 //!
-//! On reconnect the `vhost-user-backend` framework rebuilds its internal
-//! [`VringEpollHandler`] from scratch — every external fd we registered with
-//! [`register_external_fds`] is therefore lost and must be re-registered. The
-//! caller is responsible for invoking [`register_external_fds`] each time
-//! `daemon.serve()` returns and the same backend is rebound to a fresh socket.
+//! The framework builds its [`VringEpollHandler`]s (and their vring worker
+//! threads) once, in `VhostUserDaemon::new`, and they outlive every session.
+//! [`register_external_fds`] is therefore called exactly once, right after the
+//! daemon is created — a second `epoll_ctl(ADD)` of the same fd fails with
+//! `EEXIST`. A frontend reconnect only re-sends `SET_VRING_*`, which the
+//! framework applies to the handler's existing vrings.
 //!
 //! `EVENT_IDX`-correct drain semantics live in [`vring`]; this module is only
 //! the dispatch + state-glue layer.
@@ -51,7 +52,7 @@ use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::event::{EventConsumer, EventNotifier};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
-use crate::config::BusyPoll;
+use crate::config::{BusyPoll, VhostUserMode};
 use crate::datapath::intercept::InterceptCfg;
 use crate::datapath::vring::{Counters, RxProcessor, TxProcessor};
 use crate::dhcp::DhcpServer;
@@ -521,11 +522,15 @@ impl VhostUserBackendMut for WgNetBackend {
     }
 
     fn exit_event(&self, _thread_index: usize) -> Option<(EventConsumer, EventNotifier)> {
-        // Hand out a dup of the underlying eventfd, split into a
-        // (consumer, notifier) pair so the framework can register the
-        // consumer with epoll and keep the notifier for `send_exit_event`.
-        let consumer_clone = self.exit_eventfd.try_clone().ok()?;
-        let notifier_clone = self.exit_eventfd.try_clone().ok()?;
+        // Hand the framework its OWN eventfd rather than a dup of
+        // `exit_eventfd` (which is registered as `EXTRA_TOKEN_EXIT`). Sharing
+        // one eventfd means the framework's `send_exit_event()` — called from
+        // `VhostUserHandler::drop` — also trips our shutdown token, which kills
+        // the vring worker and leaves the daemon unable to serve the next
+        // session. Keeping them separate keeps the two shutdown paths apart.
+        let eventfd = EventFd::new(EFD_NONBLOCK).ok()?;
+        let consumer_clone = eventfd.try_clone().ok()?;
+        let notifier_clone = eventfd.try_clone().ok()?;
         // SAFETY: `into_raw_fd` consumes the EventFd and transfers fd
         // ownership to the EventConsumer / EventNotifier wrappers.
         let consumer = unsafe {
@@ -620,9 +625,9 @@ impl VhostUserBackendMut for WgNetBackend {
 /// Register the WG io_uring eventfd, the WG timerfd, and the externally-driven
 /// shutdown fd with the framework's [`VringEpollHandler`].
 ///
-/// This MUST be re-invoked every time the daemon's serve loop terminates and
-/// is restarted: on reconnect the framework rebuilds its epoll handler from
-/// scratch and any previously-registered fds are dropped.
+/// Call this exactly ONCE per daemon: the framework's epoll handlers are
+/// created in `VhostUserDaemon::new` and are not rebuilt on reconnect, so a
+/// second registration of the same fd fails with `EEXIST`.
 ///
 /// Token assignment is fixed at compile time
 /// ([`EXTRA_TOKEN_UDP`], [`EXTRA_TOKEN_TIMER`], [`EXTRA_TOKEN_EXIT`]) and
@@ -648,41 +653,55 @@ where
     Ok(())
 }
 
+/// How long to wait between client-mode connection attempts.
+const CLIENT_CONNECT_RETRY: Duration = Duration::from_millis(250);
+
+/// Minimum spacing between client-mode "still retrying" log lines, so that a
+/// frontend that is not up yet cannot flood the journal.
+const CLIENT_CONNECT_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Run the daemon's serve loop until the frontend disconnects (or until
 /// [`WgNetBackend::signal_exit`] is invoked).
 ///
-/// Sequence:
+/// One [`VhostUserDaemon`] is built per session, because the framework's
+/// [`VhostUserHandler`] carries the frontend's claim (`SET_OWNER`), the acked
+/// features and the guest memory mappings: a second `SET_OWNER` on the same
+/// handler fails with `InvalidOperation("already claimed")`, so a re-used
+/// daemon would reject the frontend's reconnect forever. Dropping the daemon
+/// stops its vring workers (`VhostUserHandler::drop` notifies and joins them),
+/// and the [`WgNetBackend`] — WireGuard state, DHCP leases, RX queue — is the
+/// `Arc` that lives across sessions.
 ///
-/// 1. Create the [`Listener`].
-/// 2. Call [`VhostUserDaemon::start`] — non-blocking; the framework spawns
-///    a worker thread that builds the [`VringEpollHandler`] and begins
-///    accepting connections.
-/// 3. Call [`VhostUserDaemon::get_epoll_handlers`] and feed every external
-///    fd ([`WgEngine::socket_fd`], [`WgEngine::timer_fd_raw`], the
-///    backend's exit fd) to [`register_external_fds`] so the framework's
-///    epoll loop dispatches `EXTRA_TOKEN_UDP` / `EXTRA_TOKEN_TIMER` /
-///    `EXTRA_TOKEN_EXIT` events into [`WgNetBackend::handle_event`].
-/// 4. Call [`VhostUserDaemon::wait`] which blocks until the worker exits.
+/// Per session:
 ///
-/// We CANNOT use [`VhostUserDaemon::serve`] because it bundles `start +
-/// wait` into one call, leaving no window in which to register the
-/// external fds with the freshly-built epoll handler. Without registration
-/// the WG datapath would never run — the daemon would only respond to
-/// guest-driven kicks on the virtqueues, not to inbound UDP.
+/// 1. Create the daemon (spawns the vring worker threads) and hand the
+///    backend's external fds ([`WgEngine::socket_fd`],
+///    [`WgEngine::timer_fd_raw`], the backend's exit fd) to
+///    [`register_external_fds`], so the framework's epoll loop dispatches
+///    `EXTRA_TOKEN_UDP` / `EXTRA_TOKEN_TIMER` / `EXTRA_TOKEN_EXIT` events into
+///    [`WgNetBackend::handle_event`].
+/// 2. Server mode: [`VhostUserDaemon::start`] accepts the next connection on
+///    our [`Listener`]; client mode: [`connect_to_frontend`] connects to the
+///    frontend's socket (retrying until it exists).
+/// 3. [`VhostUserDaemon::wait`] blocks until the session ends.
 ///
-/// Disconnect-shaped errors are coerced to `Ok(())` to match the behaviour
-/// of [`VhostUserDaemon::serve`] (the framework treats `Disconnected` and
-/// `PartialMessage` as expected outcomes).
+/// We CANNOT use [`VhostUserDaemon::serve`] because it bundles `start + wait`
+/// into one call, leaving no window in which to register the external fds with
+/// the freshly-built epoll handler. Without registration the WG datapath would
+/// never run — the daemon would only respond to guest-driven kicks on the
+/// virtqueues, not to inbound UDP.
+///
+/// A session that ends for connection-shaped reasons is retried (see
+/// [`is_session_teardown`]); anything else is fatal.
 pub fn run_serve_loop(
-    mut daemon: VhostUserDaemon<Arc<Mutex<WgNetBackend>>>,
     backend: Arc<Mutex<WgNetBackend>>,
+    daemon_name: &str,
     socket_path: &Path,
+    mode: VhostUserMode,
 ) -> Result<(), Error> {
     use vhost::vhost_user::Listener;
 
     let (wg_uring_eventfd, timer_fd, exit_fd) = {
-        let backend_arc = daemon.get_epoll_handlers();
-        let _ = backend_arc;
         // The backend mutex is only ever locked from this thread before the
         // daemon starts (and the framework's epoll workers spawn) and from the
         // framework's worker threads thereafter. A poisoned mutex here means
@@ -694,8 +713,15 @@ pub fn run_serve_loop(
         (b.wg_uring_eventfd(), b.wg_timer_fd(), b.exit_fd())
     };
 
-    let mut listener = Listener::new(socket_path, true)
-        .map_err(|e| Error::Vhost(VhostError::Backend(e.to_string())))?;
+    // Server mode owns the socket file and must unlink any stale one. Client
+    // mode must never touch it: the file belongs to the frontend.
+    let mut listener = match mode {
+        VhostUserMode::Server => Some(
+            Listener::new(socket_path, true)
+                .map_err(|e| Error::Vhost(VhostError::Backend(e.to_string())))?,
+        ),
+        VhostUserMode::Client => None,
+    };
 
     // QEMU 8.2.x's vhost-user-net does a multi-phase init: the first
     // connection is a probe (GET_FEATURES, GET_PROTOCOL_FEATURES,
@@ -704,33 +730,174 @@ pub fn run_serve_loop(
     // the final SET_VRING_ENABLE because SET_FEATURES was never sent. QEMU
     // then disconnects and reconnects with the actual VM-start sequence
     // (which DOES include SET_FEATURES + SET_MEM_TABLE + SET_VRING_NUM/
-    // ADDR/BASE before SET_VRING_ENABLE). We therefore loop accepting
-    // connections; external fds are re-registered on every reconnect (the
-    // framework rebuilds its epoll handler when start() is called).
+    // ADDR/BASE before SET_VRING_ENABLE). A dead session is therefore an
+    // expected outcome, not an error: we immediately wait for / establish
+    // the next one.
     loop {
-        daemon
-            .start(&mut listener)
+        let mem = GuestMemoryAtomic::new(GuestMemoryMmap::<()>::new());
+        let mut daemon = VhostUserDaemon::new(daemon_name.to_string(), Arc::clone(&backend), mem)
             .map_err(|e| Error::Vhost(VhostError::Backend(e.to_string())))?;
 
         for handler in daemon.get_epoll_handlers() {
             register_external_fds(&handler, wg_uring_eventfd, timer_fd, exit_fd)?;
         }
 
-        match daemon.wait() {
-            Ok(()) => continue,
-            Err(e) => {
-                let s = e.to_string();
-                if s.contains("Disconnected")
-                    || s.contains("PartialMessage")
-                    || s.contains("InactiveFeature")
-                    || s.contains("InvalidParam")
-                {
-                    continue;
+        match listener.as_mut() {
+            Some(listener) => daemon
+                .start(listener)
+                .map_err(|e| Error::Vhost(VhostError::Backend(e.to_string())))?,
+            // Client mode: wait for the frontend's socket to appear, then
+            // connect. A shutdown requested while waiting exits cleanly
+            // instead of hanging until the frontend shows up.
+            None => {
+                if !connect_to_frontend(&mut daemon, socket_path, exit_fd)? {
+                    return Ok(());
                 }
-                return Err(Error::Vhost(VhostError::Backend(s)));
+            }
+        }
+
+        match daemon.wait() {
+            Ok(()) => {
+                tracing::info!("vhost_user_session_ended");
+            }
+            Err(e) => {
+                if !is_session_teardown(&e) {
+                    return Err(Error::Vhost(VhostError::Backend(e.to_string())));
+                }
+                tracing::info!(error = %e, "vhost_user_session_ended");
+            }
+        }
+
+        // A session that ended because of SIGTERM (systemd stop while the
+        // frontend was connected, or while it hung up) must end the process
+        // instead of opening another session.
+        if poll_exit_fd(exit_fd, Duration::ZERO)? {
+            tracing::info!("vhost_user_shutdown_requested");
+            return Ok(());
+        }
+        // `daemon` is dropped here: its vring workers are notified and joined
+        // before the next session builds a fresh handler.
+    }
+}
+
+/// `true` when a [`VhostUserDaemon::wait`] error means "this session is over",
+/// as opposed to "the daemon is broken".
+///
+/// A frontend that hangs up, sends a truncated message, or opens a probe
+/// connection that fails the strict feature check is expected — we simply wait
+/// for (server mode) or establish (client mode) the next session. Matching is
+/// done on the error *variants*: their `Display` strings do not contain the
+/// variant names (`Disconnected` renders as "peer disconnected"), so string
+/// matching silently misclassifies every clean disconnect.
+fn is_session_teardown(error: &vhost_user_backend::Error) -> bool {
+    use vhost::vhost_user::Error as Frontend;
+    use vhost_user_backend::Error as Daemon;
+
+    match error {
+        Daemon::HandleRequest(
+            Frontend::Disconnected
+            | Frontend::PartialMessage
+            | Frontend::InactiveFeature(_)
+            | Frontend::InvalidParam
+            | Frontend::SocketBroken(_)
+            | Frontend::SocketError(_),
+        ) => true,
+        // A panicked worker thread surfaces as `WaitDaemon`; that is fatal, so
+        // it deliberately does NOT match.
+        _ => false,
+    }
+}
+
+/// Connect to the socket bound by the frontend, retrying until it exists.
+///
+/// A frontend that has not started yet (or is in the middle of a restart)
+/// simply is not listening: `UnixStream::connect` then fails with `ENOENT` or
+/// `ECONNREFUSED`. Both are expected and retried, so a daemon restart never
+/// leaves the guest without a network device once the frontend is up.
+///
+/// Returns `Ok(false)` when [`WgNetBackend::signal_exit`] fired while waiting
+/// (the caller exits cleanly), `Ok(true)` when the connection is established.
+fn connect_to_frontend(
+    daemon: &mut VhostUserDaemon<Arc<Mutex<WgNetBackend>>>,
+    socket_path: &Path,
+    exit_fd: RawFd,
+) -> Result<bool, Error> {
+    let socket = socket_path.to_str().ok_or_else(|| {
+        Error::Vhost(VhostError::Socket {
+            path: socket_path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "vhost-user socket path is not valid UTF-8",
+            ),
+        })
+    })?;
+
+    let mut attempts: u64 = 0;
+    let mut last_log: Option<Instant> = None;
+    loop {
+        attempts = attempts.saturating_add(1);
+        match daemon.start_client(socket) {
+            Ok(()) => {
+                tracing::info!(socket, attempts, "vhost_user_client_connected");
+                return Ok(true);
+            }
+            Err(e) => {
+                let due = last_log.is_none_or(|t| t.elapsed() >= CLIENT_CONNECT_LOG_INTERVAL);
+                if due {
+                    tracing::info!(
+                        socket,
+                        attempts,
+                        error = %e,
+                        "vhost_user_client_connect_retry"
+                    );
+                    last_log = Some(Instant::now());
+                } else {
+                    // Keep the journal readable when the frontend stays down
+                    // for hours, but do not lose the retry trail at debug.
+                    tracing::debug!(socket, attempts, error = %e, "vhost_user_client_connect_retry");
+                }
+                if pause_retry_or_shutdown(exit_fd)? {
+                    tracing::info!(socket, attempts, "vhost_user_client_connect_aborted");
+                    return Ok(false);
+                }
             }
         }
     }
+}
+
+/// Sleep for [`CLIENT_CONNECT_RETRY`], or return early if the backend's exit
+/// fd became readable. Returns `true` when a shutdown was requested.
+fn pause_retry_or_shutdown(exit_fd: RawFd) -> Result<bool, Error> {
+    poll_exit_fd(exit_fd, CLIENT_CONNECT_RETRY)
+}
+
+/// Poll the backend's shutdown eventfd for up to `timeout`.
+///
+/// Returns `true` when it is readable, i.e. [`WgNetBackend::signal_exit`] has
+/// been invoked. The eventfd is never drained: the framework's epoll handler
+/// treats the readiness itself as the shutdown signal, so the backend can be
+/// polled again while unwinding.
+fn poll_exit_fd(exit_fd: RawFd, timeout: Duration) -> Result<bool, Error> {
+    let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    let mut pollfd = libc::pollfd {
+        fd: exit_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pollfd` is a single initialised `pollfd` whose `fd` is the
+    // backend-owned exit eventfd, which outlives this call; `poll(2)` only
+    // writes into `pollfd.revents`.
+    let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+    if rc < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(Error::Vhost(VhostError::Backend(format!(
+            "poll on shutdown fd: {err}"
+        ))));
+    }
+    Ok(rc > 0)
 }
 
 #[cfg(test)]
@@ -943,13 +1110,25 @@ mod tests {
     }
 
     #[test]
-    fn test_signal_exit_writes_to_eventfd() {
+    fn test_exit_event_is_independent_of_backend_shutdown_fd() {
         let dir = TempDir::new().unwrap();
         let backend = make_backend(&dir);
+        let (consumer, notifier) = backend.exit_event(0).expect("exit_event");
+
+        // The framework gets its own eventfd. Sharing ours meant that the
+        // framework's `send_exit_event()` (called when a handler is dropped)
+        // also tripped our EXTRA_TOKEN_EXIT, killing the vring worker and
+        // breaking the next session.
         backend.signal_exit().expect("signal_exit");
-        // The exit_event consumer can now consume the pending notification.
-        let (consumer, _notifier) = backend.exit_event(0).expect("exit_event");
-        consumer.consume().expect("consume after signal_exit");
+        let err = consumer
+            .consume()
+            .expect_err("backend shutdown must not wake the framework's exit event");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+        notifier.notify().expect("notify framework exit event");
+        consumer
+            .consume()
+            .expect("framework exit event must be wakeable on its own");
     }
 
     #[test]
