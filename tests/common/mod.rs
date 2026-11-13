@@ -49,7 +49,7 @@ use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd as _;
-use std::os::unix::net::{UnixDatagram, UnixStream};
+use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering, fence};
@@ -156,6 +156,21 @@ reservations = []
 start = "10.42.0.2"
 end = "10.42.0.2"
 "#;
+
+/// [`CONFIG_TEMPLATE`] with `mode = "client"` under `[vhost_user]`, i.e. the
+/// daemon connects to a socket we bind instead of binding one itself.
+pub fn client_template() -> String {
+    CONFIG_TEMPLATE.replace("[vhost_user]\n", "[vhost_user]\nmode = \"client\"\n")
+}
+
+/// Which side of the vhost-user socket the harness plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontendMode {
+    /// Historical layout: the daemon binds the socket, the harness connects.
+    DaemonListens,
+    /// Daemon connects: the harness binds the socket and accepts.
+    DaemonConnects,
+}
 
 pub fn write_temp_config(template: &str, fields: BTreeMap<&str, &str>) -> tempfile::TempPath {
     let mut rendered = template.to_string();
@@ -573,6 +588,10 @@ pub struct MockVhostUserMaster {
     stderr_path: PathBuf,
     lease_path: PathBuf,
     _work_dir: tempfile::TempDir,
+    /// Which side of the socket we are (see [`FrontendMode`]).
+    mode: FrontendMode,
+    /// Client mode only: the listener we accept the daemon's connections on.
+    listener: Option<UnixListener>,
     mem: SharedMem,
     rx: RingPair,
     tx: RingPair,
@@ -623,11 +642,58 @@ impl MockVhostUserMaster {
         Self::spawn_with_options(CONFIG_TEMPLATE, None, Some("trace"), Some(notify_path))
     }
 
+    /// Spawn variant with the daemon in `client` mode: *we* bind the socket
+    /// and accept the daemon's connection.
+    pub fn spawn_client() -> Self {
+        let template = client_template();
+        Self::spawn_full(
+            &template,
+            None,
+            None,
+            None,
+            FrontendMode::DaemonConnects,
+            None,
+        )
+    }
+
+    /// Spawn variant with the daemon in `client` mode, where our listener is
+    /// only bound `delay` after the daemon was started. Exercises the
+    /// daemon's connection retry loop (the socket does not exist yet).
+    pub fn spawn_client_with_delayed_listener(delay: Duration) -> Self {
+        let template = client_template();
+        Self::spawn_full(
+            &template,
+            None,
+            None,
+            None,
+            FrontendMode::DaemonConnects,
+            Some(delay),
+        )
+    }
+
     fn spawn_with_options(
         template: &str,
         seed_lease_json: Option<&str>,
         log_filter_override: Option<&str>,
         notify_socket: Option<&Path>,
+    ) -> Self {
+        Self::spawn_full(
+            template,
+            seed_lease_json,
+            log_filter_override,
+            notify_socket,
+            FrontendMode::DaemonListens,
+            None,
+        )
+    }
+
+    fn spawn_full(
+        template: &str,
+        seed_lease_json: Option<&str>,
+        log_filter_override: Option<&str>,
+        notify_socket: Option<&Path>,
+        mode: FrontendMode,
+        listener_delay: Option<Duration>,
     ) -> Self {
         let work_dir = tempfile::Builder::new()
             .prefix("vuwg-test-")
@@ -641,6 +707,14 @@ impl MockVhostUserMaster {
         if let Some(json) = seed_lease_json {
             std::fs::write(&lease_path, json).expect("seed lease file");
         }
+
+        // Client mode: the socket must exist (or appear shortly) for the
+        // daemon to connect to, so bind it before spawning unless the test
+        // asked for a delayed listener.
+        let mut listener = match (mode, listener_delay) {
+            (FrontendMode::DaemonConnects, None) => Some(bind_listener(&socket_path)),
+            _ => None,
+        };
 
         let bin = resolve_daemon_binary();
         let mut command = Command::new(&bin);
@@ -676,7 +750,7 @@ impl MockVhostUserMaster {
         });
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        if !wait_for_path(&socket_path, deadline) {
+        if mode == FrontendMode::DaemonListens && !wait_for_path(&socket_path, deadline) {
             let mut daemon = DaemonChild { child: Some(child) };
             daemon.shutdown();
             let stderr_dump = std::fs::read_to_string(&stderr_path).unwrap_or_default();
@@ -684,6 +758,15 @@ impl MockVhostUserMaster {
                 "daemon never created its vhost-user socket at {} within 5s\n--- daemon stderr ---\n{stderr_dump}",
                 socket_path.display(),
             );
+        }
+
+        // Client mode with a delayed listener: let the daemon rack up a few
+        // failed connect attempts, then bind the socket it has been waiting for.
+        if mode == FrontendMode::DaemonConnects {
+            if let Some(delay) = listener_delay {
+                thread::sleep(delay);
+                listener = Some(bind_listener(&socket_path));
+            }
         }
 
         let mem = SharedMem::new(MEM_SIZE).expect("create shared memory region");
@@ -698,6 +781,8 @@ impl MockVhostUserMaster {
             stderr_path,
             lease_path,
             _work_dir: work_dir,
+            mode,
+            listener,
             mem,
             rx,
             tx,
@@ -779,27 +864,15 @@ impl MockVhostUserMaster {
     pub fn disconnect_and_reconnect(&mut self) {
         self.frontend = None;
         self.daemon.shutdown();
-        let removal_deadline = Instant::now() + Duration::from_secs(5);
-        while self.socket_path.exists() && Instant::now() < removal_deadline {
-            thread::sleep(Duration::from_millis(20));
+        if self.mode == FrontendMode::DaemonListens {
+            let removal_deadline = Instant::now() + Duration::from_secs(5);
+            while self.socket_path.exists() && Instant::now() < removal_deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            let _ = std::fs::remove_file(&self.socket_path);
         }
-        let _ = std::fs::remove_file(&self.socket_path);
-
-        self.rx = RingPair::rx().expect("recreate RX ring");
-        self.tx = RingPair::tx().expect("recreate TX ring");
-        let zero_pages = 3 * PAGE_SIZE;
-        unsafe {
-            std::ptr::write_bytes(
-                self.mem.base().add(usize::try_from(RX_AVAIL_BASE).unwrap()),
-                0,
-                zero_pages,
-            );
-            std::ptr::write_bytes(
-                self.mem.base().add(usize::try_from(TX_AVAIL_BASE).unwrap()),
-                0,
-                zero_pages,
-            );
-        }
+        // Client mode: the socket belongs to our listener, so it stays.
+        self.reset_rings();
 
         let bin = resolve_daemon_binary();
         let mut command = Command::new(&bin);
@@ -821,7 +894,9 @@ impl MockVhostUserMaster {
         self.daemon = DaemonChild { child: Some(child) };
 
         let socket_deadline = Instant::now() + Duration::from_secs(5);
-        if !wait_for_path(&self.socket_path, socket_deadline) {
+        if self.mode == FrontendMode::DaemonListens
+            && !wait_for_path(&self.socket_path, socket_deadline)
+        {
             let stderr_dump = self.dump_daemon_stderr();
             self.daemon.shutdown();
             panic!(
@@ -833,8 +908,67 @@ impl MockVhostUserMaster {
         self.connect_and_negotiate();
     }
 
+    /// Client mode only: simulate a frontend restart. The listener goes first
+    /// (so the daemon cannot simply re-connect to it), then the established
+    /// connection is closed — the daemon sees EOF and falls back to its
+    /// connect-retry loop — then the socket is re-bound and the daemon's
+    /// reconnect is accepted on a fresh session.
+    pub fn restart_frontend_listener(&mut self) {
+        assert_eq!(
+            self.mode,
+            FrontendMode::DaemonConnects,
+            "restart_frontend_listener only makes sense in client mode"
+        );
+        drop(self.listener.take());
+        self.frontend = None;
+        let _ = std::fs::remove_file(&self.socket_path);
+        // Long enough for a couple of failed connect attempts (retry interval
+        // is 250ms), i.e. the daemon really has to keep trying.
+        thread::sleep(Duration::from_millis(700));
+        self.listener = Some(bind_listener(&self.socket_path));
+        self.reset_rings();
+        self.connect_and_negotiate();
+    }
+
+    /// Fresh ring objects + zeroed avail/used pages: a new vhost-user session
+    /// starts from `SET_VRING_BASE(0)` again, so stale indexes from the
+    /// previous session must not leak into it.
+    fn reset_rings(&mut self) {
+        self.rx = RingPair::rx().expect("recreate RX ring");
+        self.tx = RingPair::tx().expect("recreate TX ring");
+        let zero_pages = 3 * PAGE_SIZE;
+        unsafe {
+            std::ptr::write_bytes(
+                self.mem.base().add(usize::try_from(RX_AVAIL_BASE).unwrap()),
+                0,
+                zero_pages,
+            );
+            std::ptr::write_bytes(
+                self.mem.base().add(usize::try_from(TX_AVAIL_BASE).unwrap()),
+                0,
+                zero_pages,
+            );
+        }
+    }
+
     fn connect_and_negotiate(&mut self) {
-        let stream = connect_with_retries(&self.socket_path, Duration::from_secs(5));
+        let stream = match self.mode {
+            FrontendMode::DaemonListens => {
+                connect_with_retries(&self.socket_path, Duration::from_secs(5))
+            }
+            FrontendMode::DaemonConnects => {
+                let listener = self
+                    .listener
+                    .as_ref()
+                    .expect("client-mode harness must hold a listener");
+                accept_with_retries(
+                    listener,
+                    &self.socket_path,
+                    Duration::from_secs(5),
+                    &self.stderr_path,
+                )
+            }
+        };
         let mut frontend = Frontend::from_stream(stream, u64::from(NUM_QUEUES));
         self.checked(frontend.set_owner(), "set_owner");
 
@@ -1078,6 +1212,50 @@ fn connect_with_retries(path: &Path, total: Duration) -> UnixStream {
     }
     panic!(
         "could not connect to vhost-user socket {} within {:?}: {:?}",
+        path.display(),
+        total,
+        last_error,
+    );
+}
+
+/// Bind the frontend side of the vhost-user socket (client mode).
+fn bind_listener(path: &Path) -> UnixListener {
+    let _ = std::fs::remove_file(path);
+    UnixListener::bind(path)
+        .unwrap_or_else(|e| panic!("bind frontend socket at {}: {e}", path.display()))
+}
+
+/// Accept the daemon's connection, polling until `total` elapses.
+fn accept_with_retries(
+    listener: &UnixListener,
+    path: &Path,
+    total: Duration,
+    stderr_path: &Path,
+) -> UnixStream {
+    listener
+        .set_nonblocking(true)
+        .expect("set frontend listener non-blocking");
+    let deadline = Instant::now() + total;
+    let mut last_error: Option<std::io::Error> = None;
+    while Instant::now() < deadline {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("set accepted stream blocking");
+                return stream;
+            }
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::WouldBlock {
+                    last_error = Some(error);
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    let stderr_dump = std::fs::read_to_string(stderr_path).unwrap_or_default();
+    panic!(
+        "daemon never connected to frontend socket {} within {:?}: {:?}\n--- daemon stderr ---\n{stderr_dump}",
         path.display(),
         total,
         last_error,

@@ -101,6 +101,11 @@ ip  = "10.42.0.2"
 socket     = "/run/vhost-user-wg/vm1.sock"
 queue_size = 256
 num_queues = 2
+# "server" (default): the daemon binds the socket, the frontend connects.
+# "client": the frontend binds it (<source mode='server'/>), the daemon
+# connects with retry/reconnect — the daemon can then be restarted without
+# the guest losing its NIC.
+mode       = "server"
 
 [network]
 subnet  = "10.42.0.0/30"
@@ -159,7 +164,7 @@ Full annotated example: [`examples/example-vm.toml`](examples/example-vm.toml)
 | Section | Key fields | Notes |
 |---------|-----------|-------|
 | `[vm]` | `mac`, `mtu`, `ip` | MAC must match the virtio-net device; MTU 1420 recommended |
-| `[vhost_user]` | `socket`, `queue_size` | Socket parent dir must exist before start |
+| `[vhost_user]` | `socket`, `queue_size`, `num_queues`, `mode` | Socket parent dir must exist before start; `mode` is `server` (default) or `client` |
 | `[network]` | `subnet`, `gateway`, `dns` | Only /30 subnets accepted |
 | `[wireguard]` | `private_key_file` or `private_key`, `listen_port` | Exactly one key source required |
 | `[[wireguard.peers]]` | `public_key`, `endpoint`, `allowed_ips` | Repeat section for each peer |
@@ -197,7 +202,13 @@ Leases are written to `/var/lib/vhost-user-wg/leases.json` (or `$VUWG_LEASE_PATH
 
 **Frontend disconnect / VM restart**
 
-The daemon exits when the vhost-user frontend disconnects. The systemd unit has `Restart=on-failure`, so it will restart automatically. If you need the daemon to survive VM reboots without restarting, set `Restart=always`.
+A frontend disconnect does not end the process: the daemon keeps running and
+serves the next session. In `mode = "client"` it reconnects by itself, so the
+guest's virtio-net device keeps working across daemon restarts. In `mode =
+"server"` the frontend's connection is gone for good (QEMU does not reconnect
+its vhost-user chardev), so the guest loses its NIC until the VM is restarted —
+if that matters, switch to client mode. `Restart=on-failure` only covers genuine
+failures.
 
 **"missing --config" error**
 

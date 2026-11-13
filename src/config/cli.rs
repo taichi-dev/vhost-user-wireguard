@@ -5,6 +5,23 @@ use std::path::PathBuf;
 
 use super::Config;
 
+/// `--vhost-user-mode` values; kept separate from [`super::VhostUserMode`] so
+/// the config type does not depend on clap.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VhostUserModeArg {
+    Server,
+    Client,
+}
+
+impl From<VhostUserModeArg> for super::VhostUserMode {
+    fn from(value: VhostUserModeArg) -> Self {
+        match value {
+            VhostUserModeArg::Server => Self::Server,
+            VhostUserModeArg::Client => Self::Client,
+        }
+    }
+}
+
 /// CLI argument parser that produces overrides for Config.
 /// Every field is Option<T> so unset flags don't override TOML values.
 #[derive(clap::Parser, Debug, Default)]
@@ -41,6 +58,11 @@ pub struct CliArgs {
     /// vhost-user number of queues
     #[arg(long)]
     pub vhost_user_num_queues: Option<u16>,
+
+    /// vhost-user socket direction: "server" (we bind, frontend connects) or
+    /// "client" (frontend binds, we connect with retry)
+    #[arg(long, value_enum)]
+    pub vhost_user_mode: Option<VhostUserModeArg>,
 
     /// Network subnet in CIDR notation
     #[arg(long)]
@@ -116,6 +138,9 @@ pub fn apply_overrides(mut config: Config, args: &CliArgs) -> Config {
     if let Some(num_queues) = args.vhost_user_num_queues {
         config.vhost_user.num_queues = num_queues;
     }
+    if let Some(mode) = args.vhost_user_mode {
+        config.vhost_user.mode = mode.into();
+    }
     if let Some(subnet) = args.network_subnet {
         config.network.subnet = subnet;
     }
@@ -158,7 +183,9 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::path::PathBuf;
 
-    use super::super::{BusyPoll, Dhcp, DhcpPool, Network, VhostUser, Vm, Wireguard};
+    use super::super::{
+        BusyPoll, Dhcp, DhcpPool, Network, VhostUser, VhostUserMode, Vm, Wireguard,
+    };
     use super::*;
 
     fn make_test_config() -> Config {
@@ -173,6 +200,7 @@ mod tests {
                 socket: PathBuf::from("/tmp/vhost.sock"),
                 queue_size: 256,
                 num_queues: 2,
+                mode: VhostUserMode::Server,
             },
             dhcp: Dhcp {
                 pool: DhcpPool {
@@ -235,5 +263,16 @@ mod tests {
         };
         let result = apply_overrides(config, &args);
         assert_eq!(result.wireguard.listen_port, 12345);
+    }
+
+    #[test]
+    fn test_vhost_user_mode_override() {
+        let config = make_test_config();
+        let args = CliArgs {
+            vhost_user_mode: Some(VhostUserModeArg::Client),
+            ..Default::default()
+        };
+        let result = apply_overrides(config, &args);
+        assert_eq!(result.vhost_user.mode, VhostUserMode::Client);
     }
 }
