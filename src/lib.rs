@@ -36,15 +36,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use vhost_user_backend::VhostUserDaemon;
-use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 use zeroize::Zeroize;
 
 use crate::config::cli::CliArgs;
 use crate::datapath::WgNetBackend;
 use crate::datapath::intercept::InterceptCfg;
 use crate::dhcp::DhcpServer;
-use crate::error::{ConfigError, Error, VhostError, WgError};
+use crate::error::{ConfigError, Error, WgError};
 use crate::ops::logging::LogFormat;
 use crate::wg::WgEngine;
 
@@ -89,7 +87,7 @@ const DAEMON_NAME: &str = "vhost-user-wireguard";
 /// 12. Spawn a signal-handling thread that pokes the backend's exit fd.
 /// 13. Drop privileges, then drop capabilities (in that order).
 /// 14. Tell systemd we are ready (`READY=1`).
-/// 15. Build the [`VhostUserDaemon`] and run the serve loop.
+/// 15. Run the serve loop (which builds one `VhostUserDaemon` per session).
 /// 16. On loop exit: notify systemd of stopping, signal the handler thread to
 ///     exit by raising the same exit fd, join it, and return the loop result.
 pub fn run(cli: CliArgs) -> Result<(), Error> {
@@ -206,7 +204,7 @@ pub fn run(cli: CliArgs) -> Result<(), Error> {
 
     // 12. Spawn the signal-handling thread. signal_hook installs the actual
     //     POSIX signal handlers and we just iterate over the produced events.
-    let signal_thread = spawn_signal_thread(Arc::clone(&backend))?;
+    let (signal_thread, signal_handle) = spawn_signal_thread(Arc::clone(&backend))?;
 
     // 13. Drop privileges (setgid before setuid) and then capabilities.
     //     These steps must happen BEFORE notify_ready: systemd interprets
@@ -222,25 +220,31 @@ pub fn run(cli: CliArgs) -> Result<(), Error> {
     //     outside of systemd), so this is safe in foreground mode too.
     crate::ops::systemd::notify_ready()?;
 
-    // 15. Build the daemon and run the serve loop. Memory is empty at first;
-    //     the frontend populates it via SET_MEM_TABLE during negotiation.
-    let mem = GuestMemoryAtomic::new(GuestMemoryMmap::<()>::new());
+    // 15. Build the daemon and run the serve loop. Servicing a session (and
+    //     building its daemon, plus the empty guest memory that the frontend
+    //     populates via SET_MEM_TABLE) is the serve loop's job, since a new
+    //     daemon is required for every session.
     let socket_path = config.vhost_user.socket.clone();
-    let daemon = VhostUserDaemon::new(DAEMON_NAME.to_string(), Arc::clone(&backend), mem)
-        .map_err(|e| Error::Vhost(VhostError::Backend(e.to_string())))?;
-
-    let serve_result = crate::datapath::run_serve_loop(daemon, Arc::clone(&backend), &socket_path);
+    let serve_result = crate::datapath::run_serve_loop(
+        Arc::clone(&backend),
+        DAEMON_NAME,
+        &socket_path,
+        config.vhost_user.mode,
+    );
 
     // 16. Tear down. notify_stopping is best-effort and swallows errors
     //     internally, so we propagate it without checking. Then poke the
-    //     exit fd to wake the signal thread (in case the loop exited for a
-    //     reason other than signal delivery), and join it.
+    //     exit fd (so a serve loop still parked in an epoll wait unwinds) and
+    //     close the signal thread's self-pipe: it only returns early on a
+    //     signal, so without `close()` this join would block until the next
+    //     SIGTERM even though the serve loop already decided to exit.
     let _ = crate::ops::systemd::notify_stopping();
 
     if let Ok(b) = backend.lock() {
         let _ = b.signal_exit();
     }
 
+    signal_handle.close();
     if let Err(panic) = signal_thread.join() {
         tracing::warn!(?panic, "signal_thread_panicked");
     }
@@ -252,14 +256,19 @@ pub fn run(cli: CliArgs) -> Result<(), Error> {
 /// shutdown [`vmm_sys_util::eventfd::EventFd`].
 ///
 /// The thread exits after a single signal — there is no point looping because
-/// the serve loop will tear down on the first observed shutdown event.
-fn spawn_signal_thread(backend: Arc<Mutex<WgNetBackend>>) -> Result<thread::JoinHandle<()>, Error> {
+/// the serve loop will tear down on the first observed shutdown event. It also
+/// exits when the returned [`signal_hook::iterator::Handle`] is closed, which
+/// is how `run()` reaps it when the serve loop ends on its own.
+fn spawn_signal_thread(
+    backend: Arc<Mutex<WgNetBackend>>,
+) -> Result<(thread::JoinHandle<()>, signal_hook::iterator::Handle), Error> {
     use signal_hook::consts::{SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
 
     let mut signals = Signals::new([SIGTERM, SIGINT])?;
+    let pipe_handle = signals.handle();
 
-    let handle = thread::Builder::new()
+    let thread_handle = thread::Builder::new()
         .name("signal-handler".to_string())
         .spawn(move || {
             if let Some(signal) = signals.forever().next() {
@@ -277,5 +286,5 @@ fn spawn_signal_thread(backend: Arc<Mutex<WgNetBackend>>) -> Result<thread::Join
             }
         })?;
 
-    Ok(handle)
+    Ok((thread_handle, pipe_handle))
 }

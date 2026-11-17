@@ -25,12 +25,34 @@ pub struct Wireguard {
     pub peers: Vec<WgPeer>,
 }
 
+/// Which side of the vhost-user socket creates it.
+///
+/// The vhost-user protocol itself does not care who listens: the frontend is
+/// always the master (it sends `GET_FEATURES`, `SET_MEM_TABLE`, ...), the
+/// daemon is always the backend. Only the socket direction differs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VhostUserMode {
+    /// Bind `vhost_user.socket` ourselves and accept the frontend's
+    /// connection (frontend side uses `mode='client'`).
+    #[default]
+    Server,
+    /// Connect to a socket bound by the frontend (frontend side uses
+    /// `mode='server'`), with retry until it appears and reconnect whenever
+    /// the channel drops.
+    Client,
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VhostUser {
     pub socket: std::path::PathBuf,
     pub queue_size: u16,
     pub num_queues: u16,
+    /// Socket direction; see [`VhostUserMode`]. Defaults to `server` so that
+    /// existing configurations keep working unchanged.
+    #[serde(default)]
+    pub mode: VhostUserMode,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]

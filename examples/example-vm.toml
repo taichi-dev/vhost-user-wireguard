@@ -49,6 +49,16 @@ queue_size = 256
 # Number of virtqueue pairs (RX + TX). Must be exactly 2.
 num_queues = 2
 
+# Which side creates the socket.
+#   "server" (default) — the daemon binds `socket` and the frontend connects
+#                        (libvirt/QEMU <source ... mode='client'/>).
+#   "client"           — the frontend binds `socket` and the daemon connects
+#                        (<source ... mode='server'/>), retrying until the
+#                        socket exists and reconnecting whenever the session
+#                        drops. Survives daemon restarts: the guest keeps its
+#                        virtio-net device because the frontend owns the socket.
+mode = "server"
+
 
 # -----------------------------------------------------------------------------
 # [network] — Layer-3 topology visible to the VM

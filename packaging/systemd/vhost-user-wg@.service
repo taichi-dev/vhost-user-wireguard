@@ -20,6 +20,12 @@ TimeoutStopSec=5s
 # Privilege & sandboxing
 User=vhost-user-wg
 Group=vhost-user-wg
+# Client mode (`[vhost_user] mode = "client"`) only: the frontend creates the
+# socket, and libvirt's QEMU creates it as libvirt-qemu:kvm with mode 0775 —
+# connecting to a unix socket needs write permission, so the daemon must be in
+# that group. QEMU blocks on VM start until the backend connects, so there is
+# no window to chmod the socket first.
+#SupplementaryGroups=kvm
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 ProtectSystem=strict

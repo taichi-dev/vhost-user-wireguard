@@ -75,6 +75,27 @@ ip = "10.0.0.2"
         let cfg = result.unwrap();
         assert_eq!(cfg.wireguard.listen_port, 51820);
         assert_eq!(cfg.vhost_user.queue_size, 256);
+        // `mode` is optional and defaults to the historical socket direction.
+        assert_eq!(cfg.vhost_user.mode, crate::config::VhostUserMode::Server);
+    }
+
+    #[test]
+    fn test_load_client_mode() {
+        let client = VALID_TOML.replace("num_queues = 2", "num_queues = 2\nmode = \"client\"");
+        let f = write_temp(&client);
+        let cfg = load(f.path()).expect("client mode must parse");
+        assert_eq!(cfg.vhost_user.mode, crate::config::VhostUserMode::Client);
+    }
+
+    #[test]
+    fn test_load_rejects_unknown_mode() {
+        let bogus =
+            VALID_TOML.replace("num_queues = 2", "num_queues = 2\nmode = \"bidirectional\"");
+        let f = write_temp(&bogus);
+        assert!(
+            matches!(load(f.path()), Err(ConfigError::TomlParse(_))),
+            "unknown mode must be a parse error"
+        );
     }
 
     #[test]

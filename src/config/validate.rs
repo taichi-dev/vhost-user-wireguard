@@ -273,8 +273,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        BusyPoll, Config, Dhcp, DhcpPool, DhcpReservation, Network, VhostUser, Vm, WgPeer,
-        Wireguard,
+        BusyPoll, Config, Dhcp, DhcpPool, DhcpReservation, Network, VhostUser, VhostUserMode, Vm,
+        WgPeer, Wireguard,
     };
 
     fn ipv4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
@@ -305,6 +305,7 @@ mod tests {
                 socket: PathBuf::from("/tmp/vhu.sock"),
                 queue_size: 256,
                 num_queues: 2,
+                mode: VhostUserMode::Server,
             },
             dhcp: Dhcp {
                 pool: DhcpPool {

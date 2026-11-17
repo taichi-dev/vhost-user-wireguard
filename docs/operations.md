@@ -261,7 +261,9 @@ mtu = 1420
 ip  = "10.66.66.2"
 
 [vhost_user]
-socket = "/run/vhost-user-wg/vm1.sock"
+# client mode: a dedicated directory, not the daemon's /run/vhost-user-wg
+socket = "/var/lib/libvirt/vuwg/vm1.sock"
+mode   = "client"
 ...
 ]]></vuwg:toml>
     </vuwg:config>
@@ -269,7 +271,7 @@ socket = "/run/vhost-user-wg/vm1.sock"
   <devices>
     <interface type='vhostuser'>
       <mac address='52:54:00:12:34:01'/>
-      <source type='unix' path='/run/vhost-user-wg/vm1.sock' mode='client'/>
+      <source type='unix' path='/var/lib/libvirt/vuwg/vm1.sock' mode='server'/>
       <model type='virtio'/>
       <driver queues='1' rx_queue_size='256' tx_queue_size='256'/>
     </interface>
@@ -278,15 +280,57 @@ socket = "/run/vhost-user-wg/vm1.sock"
 ```
 
 The socket path in `<interface>` MUST match `[vhost_user].socket` in the
-embedded TOML. By convention the daemon's socket lives at
-`/run/vhost-user-wg/<domain>.sock`, which is also where the hook expects to
-find it.
+embedded TOML; the hook takes the path from there (it used to assume
+`/run/vhost-user-wg/<domain>.sock`, which is only the server-mode convention —
+client mode usually wants a directory of its own, see below).
+
+The two `mode`s are mirror images of each other — pick exactly one pair:
+
+| config | `<source mode='...'>` | who binds the socket | survives a daemon restart |
+|--------|-----------------------|----------------------|---------------------------|
+| `mode = "client"` | `server` | QEMU/frontend | yes — the daemon reconnects |
+| `mode = "server"` (default) | `client` | the daemon | no — QEMU never reconnects |
+
+The hook reads the same `mode` from the embedded TOML: in server mode it waits
+for the socket at `prepare` and chowns it for QEMU; in client mode it prepares
+the socket's *directory* for QEMU at `prepare` and chowns the socket itself for
+the daemon at `started`.
+
+### Client mode prerequisites
+
+In client mode the socket belongs to the frontend, which changes two things:
+
+1. **The socket must live in a directory the frontend can create it in, and
+   that directory must not be the daemon's own `RuntimeDirectory`.** The hook
+   grants the QEMU group write access to the socket's directory, but
+   `/run/vhost-user-wg` is the unit's shared `RuntimeDirectory`: every
+   `vhost-user-wg@*` start recreates it as `vhost-user-wg` `0755`, which can
+   revoke that grant between the hook and QEMU's `bind()` (another VM starting
+   in parallel is enough) and leave the guest without a NIC. Point
+   `[vhost_user] socket` at a dedicated directory — e.g.
+   `/var/lib/libvirt/vuwg/<domain>.sock` — and the hook creates it with the
+   right owner. Configuring the shared directory in client mode is a hard
+   error: the hook logs why and aborts the VM start.
+2. **The daemon must be able to connect to it.** QEMU creates the socket as
+   `libvirt-qemu:kvm` with mode 0775, and connecting to a unix socket requires
+   write permission. libvirt passes `server=on` *without* `wait=off`, so QEMU
+   blocks during VM start until a backend connects — there is no window in
+   which the hook could chmod it. Run the daemon in the socket's group:
+
+   ```ini
+   # /etc/systemd/system/vhost-user-wg@.service.d/50-kvm-group.conf
+   [Service]
+   SupplementaryGroups=kvm
+   ```
+
+   (Server mode has no such requirement: the daemon owns the socket.)
 
 ### Lifecycle
 
 | libvirt event       | hook action                                                    |
 |---------------------|---------------------------------------------------------------|
-| `prepare/begin`     | Write `/run/vhost-user-wg/<domain>.toml` (mode 0600, owned by `vhost-user-wg`), `systemctl start vhost-user-wg@<domain>`, wait for socket, chgrp `libvirt-qemu` (or fall back to `chmod 0666`). |
+| `prepare/begin`     | Write `/run/vhost-user-wg/<domain>.toml` (mode 0600, owned by `vhost-user-wg`), `systemctl start vhost-user-wg@<domain>`. Server mode then waits for the socket and chgrp `libvirt-qemu` (or falls back to `chmod 0666`); client mode returns immediately — the daemon retries until QEMU binds the socket. |
+| `started/*`         | Client mode only: QEMU has bound the socket, chown it to `vhost-user-wg` + `chmod 0660` so the daemon may connect. |
 | `release/end`       | `systemctl stop vhost-user-wg@<domain>`, remove the TOML file. |
 | Any other event/phase | No-op.                                                       |
 
@@ -406,7 +450,16 @@ systemctl status vhost-user-wg@vm1.service
 3. Replace the binary: `cp vhost-user-wireguard /usr/bin/`
 4. Start the daemon: `systemctl start vhost-user-wg@vm1.service`
 
-The VM will lose network connectivity while the daemon is stopped. If the VM is running, it will reconnect automatically when the daemon restarts (the vhost-user frontend reconnects on socket availability).
+The VM loses network connectivity while the daemon is stopped, and where it
+comes back depends on `[vhost_user] mode`:
+
+| mode | after the daemon restarts |
+|------|---------------------------|
+| `client` (frontend binds the socket) | daemon reconnects on its own; the guest's NIC keeps working |
+| `server` (daemon binds the socket) | QEMU's vhost-user chardev has no reconnect, so the guest stays "cable unplugged" until the VM is restarted. Fixing the socket permissions does not help — QEMU never retries. |
+
+That asymmetry is why client mode exists: with it, restarting the daemon (or
+having it restarted by a package upgrade) is a non-event for the guest.
 
 For zero-downtime updates, you'd need to live-migrate the VM to another host first. The daemon doesn't support hot reload.
 
@@ -456,7 +509,11 @@ chown vhost-user-wg:vhost-user-wg /run/vhost-user-wg
 
 ### Daemon exits immediately after VM disconnects
 
-This is expected behaviour. The daemon exits when the vhost-user frontend disconnects. The systemd unit has `Restart=on-failure`, so it restarts automatically. If you want the daemon to stay running between VM reboots, change `Restart=on-failure` to `Restart=always` in the unit file.
+It should not: a frontend disconnect only ends that session, and the daemon
+keeps waiting for the next one (`mode = "server"`) or reconnects
+(`mode = "client"`). If the process really exits, check the journal for a
+non-connection error — those are the only ones that terminate the serve loop.
+`Restart=on-failure` in the unit covers that case.
 
 ### Guest gets no DHCP lease
 
