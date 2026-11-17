@@ -261,7 +261,8 @@ mtu = 1420
 ip  = "10.66.66.2"
 
 [vhost_user]
-socket = "/run/vhost-user-wg/vm1.sock"
+# client mode: a dedicated directory, not the daemon's /run/vhost-user-wg
+socket = "/var/lib/libvirt/vuwg/vm1.sock"
 mode   = "client"
 ...
 ]]></vuwg:toml>
@@ -270,7 +271,7 @@ mode   = "client"
   <devices>
     <interface type='vhostuser'>
       <mac address='52:54:00:12:34:01'/>
-      <source type='unix' path='/run/vhost-user-wg/vm1.sock' mode='server'/>
+      <source type='unix' path='/var/lib/libvirt/vuwg/vm1.sock' mode='server'/>
       <model type='virtio'/>
       <driver queues='1' rx_queue_size='256' tx_queue_size='256'/>
     </interface>
@@ -279,9 +280,9 @@ mode   = "client"
 ```
 
 The socket path in `<interface>` MUST match `[vhost_user].socket` in the
-embedded TOML. By convention the daemon's socket lives at
-`/run/vhost-user-wg/<domain>.sock`, which is also where the hook expects to
-find it.
+embedded TOML; the hook takes the path from there (it used to assume
+`/run/vhost-user-wg/<domain>.sock`, which is only the server-mode convention —
+client mode usually wants a directory of its own, see below).
 
 The two `mode`s are mirror images of each other — pick exactly one pair:
 
@@ -290,19 +291,26 @@ The two `mode`s are mirror images of each other — pick exactly one pair:
 | `mode = "client"` | `server` | QEMU/frontend | yes — the daemon reconnects |
 | `mode = "server"` (default) | `client` | the daemon | no — QEMU never reconnects |
 
-The hook reads the same `mode` from the embedded TOML, so it knows whether it
-has to chown/chmod the socket for QEMU (server mode, at `prepare`) or for the
-daemon (client mode, at `started`).
+The hook reads the same `mode` from the embedded TOML: in server mode it waits
+for the socket at `prepare` and chowns it for QEMU; in client mode it prepares
+the socket's *directory* for QEMU at `prepare` and chowns the socket itself for
+the daemon at `started`.
 
 ### Client mode prerequisites
 
 In client mode the socket belongs to the frontend, which changes two things:
 
-1. **The socket must live where the frontend can create it.** The hook grants
-   the QEMU group write access to whatever directory `[vhost_user] socket`
-   names (the default `/run/vhost-user-wg` is created for the daemon and is
-   otherwise not writable by QEMU), so the stock path works; a dedicated
-   directory is still a good idea.
+1. **The socket must live in a directory the frontend can create it in, and
+   that directory must not be the daemon's own `RuntimeDirectory`.** The hook
+   grants the QEMU group write access to the socket's directory, but
+   `/run/vhost-user-wg` is the unit's shared `RuntimeDirectory`: every
+   `vhost-user-wg@*` start recreates it as `vhost-user-wg` `0755`, which can
+   revoke that grant between the hook and QEMU's `bind()` (another VM starting
+   in parallel is enough) and leave the guest without a NIC. Point
+   `[vhost_user] socket` at a dedicated directory — e.g.
+   `/var/lib/libvirt/vuwg/<domain>.sock` — and the hook creates it with the
+   right owner. Configuring the shared directory in client mode is a hard
+   error: the hook logs why and aborts the VM start.
 2. **The daemon must be able to connect to it.** QEMU creates the socket as
    `libvirt-qemu:kvm` with mode 0775, and connecting to a unix socket requires
    write permission. libvirt passes `server=on` *without* `wait=off`, so QEMU

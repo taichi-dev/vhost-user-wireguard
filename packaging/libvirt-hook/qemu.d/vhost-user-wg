@@ -177,30 +177,45 @@ def detect_client_mode(toml_text: str) -> bool:
     return False
 
 
-def make_dir_writable_for_qemu(sock_path: Path) -> None:
+def make_dir_writable_for_qemu(sock_path: Path) -> bool:
     """Client mode: let the frontend create the socket inside its directory.
 
-    The default socket lives in `/run/vhost-user-wg`, which systemd creates for
-    the daemon (`vhost-user-wg`, mode 0755) — a `libvirt-qemu` QEMU could not
-    bind there. Grant the QEMU side group write and leave the rest alone.
+    Grants the QEMU group write access to the socket's directory. Returns
+    `False` when the socket sits in the daemon's shared systemd
+    `RuntimeDirectory`: every `vhost-user-wg@*` start recreates that directory
+    as `vhost-user-wg 0755`, so a grant there can be revoked between this hook
+    and QEMU's `bind()` (another VM starting in parallel is enough) and the
+    guest would silently come up without a NIC.
     """
     parent = sock_path.parent
+    if os.path.realpath(parent) == os.path.realpath(RUNTIME_DIR):
+        log(
+            f"client mode: socket {sock_path} is inside the daemon's shared"
+            f" RuntimeDirectory {RUNTIME_DIR}; any vhost-user-wg@* start resets"
+            " that directory's group/mode, so QEMU may fail to bind. Point"
+            " [vhost_user] socket at a dedicated directory instead, e.g."
+            " /var/lib/libvirt/vuwg/<domain>.sock"
+        )
+        return False
+
     try:
         parent.mkdir(mode=0o775, parents=True, exist_ok=True)
     except OSError as exc:
         log(f"mkdir {parent} failed ({exc}); QEMU may not be able to bind {sock_path}")
-        return
+        return False
 
     group = detect_qemu_group()
     if group is None:
         log(f"no libvirt-qemu/qemu/kvm group found; leaving {parent} as-is")
-        return
+        return False
     try:
         shutil.chown(parent, group=group)
         parent.chmod(parent.stat().st_mode | stat.S_IWGRP | stat.S_IXGRP)
         log(f"chgrp {group} + group-write on {parent}")
     except (LookupError, OSError) as exc:
         log(f"chgrp {group} on {parent} failed ({exc}); QEMU may not be able to bind")
+        return False
+    return True
 
 
 def chmod_socket_for_daemon(sock_path: Path) -> None:
@@ -258,12 +273,17 @@ def handle_prepare(domain: str) -> int:
         # wait for here: the daemon retries until it appears. Two things still
         # have to be prepared, because QEMU creates the socket itself and then
         # blocks until a backend connects:
-        #   * the socket's directory must be writable by the QEMU user (the
-        #     default /run/vhost-user-wg belongs to the daemon and is 0755),
-        #   * the daemon must be able to connect to what QEMU creates (that is
-        #     group membership on the daemon's side, see the packaged unit).
+        #   * the socket's directory must be writable by the QEMU user — and
+        #     stable, so it must not be the daemon's shared RuntimeDirectory,
+        #   * the daemon must be able to connect to what QEMU creates (group
+        #     membership on the daemon's side, see the packaged unit).
         sock = socket_from_toml(toml_text, domain)
-        make_dir_writable_for_qemu(sock)
+        if not make_dir_writable_for_qemu(sock):
+            # Fail loudly: a VM that starts anyway comes up without a NIC and
+            # the failure only shows up in QEMU's log.
+            log(f"client mode: refusing to start {domain} with socket {sock}")
+            systemctl("stop", unit)
+            return 1
         log(f"client mode: {unit} started, waiting for {sock}")
         return 0
 
