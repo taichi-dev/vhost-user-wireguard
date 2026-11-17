@@ -591,6 +591,16 @@ impl VhostUserBackendMut for WgNetBackend {
         // kick fds are drained by the framework before this method runs,
         // so dropping them here does not cause an epoll re-fire spin.
         if self.memory().is_none() {
+            // The WG socket fd is ours, and epoll is level-triggered: leaving
+            // the io_uring eventfd readable would spin this worker thread until
+            // SET_MEM_TABLE arrives. Burn the completions (which only fills the
+            // backend RX queue, no guest memory needed) and skip the vring
+            // flush; the queued frames go out on the first flush afterwards.
+            if device_event == EXTRA_TOKEN_UDP {
+                let budget = self.busy_poll.packet_budget().max(1);
+                let drained = self.drain_wg_socket_burst(budget);
+                self.busy_poll.observe(drained);
+            }
             return Ok(());
         }
 
@@ -738,10 +748,6 @@ pub fn run_serve_loop(
         let mut daemon = VhostUserDaemon::new(daemon_name.to_string(), Arc::clone(&backend), mem)
             .map_err(|e| Error::Vhost(VhostError::Backend(e.to_string())))?;
 
-        for handler in daemon.get_epoll_handlers() {
-            register_external_fds(&handler, wg_uring_eventfd, timer_fd, exit_fd)?;
-        }
-
         match listener.as_mut() {
             Some(listener) => daemon
                 .start(listener)
@@ -754,6 +760,16 @@ pub fn run_serve_loop(
                     return Ok(());
                 }
             }
+        }
+
+        // Only after a session exists: the vring workers start with the daemon
+        // and the epoll is level-triggered, so registering the - always ready -
+        // WG socket fd before a frontend is attached would spin the worker on
+        // `EXTRA_TOKEN_UDP` for as long as nobody drains it. Each session gets
+        // its own daemon (hence its own epoll handler), so this cannot hit the
+        // `EEXIST` that re-registering on a shared handler would.
+        for handler in daemon.get_epoll_handlers() {
+            register_external_fds(&handler, wg_uring_eventfd, timer_fd, exit_fd)?;
         }
 
         match daemon.wait() {

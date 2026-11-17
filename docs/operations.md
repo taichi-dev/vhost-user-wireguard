@@ -298,10 +298,11 @@ daemon (client mode, at `started`).
 
 In client mode the socket belongs to the frontend, which changes two things:
 
-1. **The socket must live where the frontend can create it.** `/run/vhost-user-wg`
-   is owned by `vhost-user-wg`, so point `[vhost_user] socket` at a directory
-   the QEMU user can write to (e.g. `/var/lib/libvirt/<vm>/vhost.sock`); the
-   hook honours whatever path the config names.
+1. **The socket must live where the frontend can create it.** The hook grants
+   the QEMU group write access to whatever directory `[vhost_user] socket`
+   names (the default `/run/vhost-user-wg` is created for the daemon and is
+   otherwise not writable by QEMU), so the stock path works; a dedicated
+   directory is still a good idea.
 2. **The daemon must be able to connect to it.** QEMU creates the socket as
    `libvirt-qemu:kvm` with mode 0775, and connecting to a unix socket requires
    write permission. libvirt passes `server=on` *without* `wait=off`, so QEMU

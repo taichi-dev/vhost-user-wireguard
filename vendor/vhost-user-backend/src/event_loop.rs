@@ -90,13 +90,23 @@ where
 
         let exit_event_fd = if let Some((consumer, notifier)) = exit_event_fd {
             let id = backend.num_queues();
-            epoll
-                .ctl(
-                    ControlOperation::Add,
-                    consumer.into_raw_fd(),
-                    EpollEvent::new(EventSet::IN, id as u64),
-                )
-                .map_err(VringEpollError::RegisterExitEvent)?;
+            let consumer_fd = consumer.into_raw_fd();
+            let registered = epoll.ctl(
+                ControlOperation::Add,
+                consumer_fd,
+                EpollEvent::new(EventSet::IN, id as u64),
+            );
+            // LOCAL PATCH (taichi-dev/vhost-user-wireguard): `epoll_ctl`
+            // registers the *file description*, not this fd, and `notifier` is a
+            // dup of the same eventfd — so closing our copy keeps the
+            // registration (and `send_exit_event`) working. Without this the fd
+            // leaked for the life of the process; with one daemon per
+            // vhost-user session that is one fd per frontend probe/reconnect.
+            //
+            // SAFETY: `consumer_fd` came from `into_raw_fd()`, so we own it and
+            // close it exactly once. It is not used after this point.
+            unsafe { libc::close(consumer_fd) };
+            registered.map_err(VringEpollError::RegisterExitEvent)?;
             Some(notifier)
         } else {
             None

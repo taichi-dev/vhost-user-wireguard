@@ -177,6 +177,32 @@ def detect_client_mode(toml_text: str) -> bool:
     return False
 
 
+def make_dir_writable_for_qemu(sock_path: Path) -> None:
+    """Client mode: let the frontend create the socket inside its directory.
+
+    The default socket lives in `/run/vhost-user-wg`, which systemd creates for
+    the daemon (`vhost-user-wg`, mode 0755) — a `libvirt-qemu` QEMU could not
+    bind there. Grant the QEMU side group write and leave the rest alone.
+    """
+    parent = sock_path.parent
+    try:
+        parent.mkdir(mode=0o775, parents=True, exist_ok=True)
+    except OSError as exc:
+        log(f"mkdir {parent} failed ({exc}); QEMU may not be able to bind {sock_path}")
+        return
+
+    group = detect_qemu_group()
+    if group is None:
+        log(f"no libvirt-qemu/qemu/kvm group found; leaving {parent} as-is")
+        return
+    try:
+        shutil.chown(parent, group=group)
+        parent.chmod(parent.stat().st_mode | stat.S_IWGRP | stat.S_IXGRP)
+        log(f"chgrp {group} + group-write on {parent}")
+    except (LookupError, OSError) as exc:
+        log(f"chgrp {group} on {parent} failed ({exc}); QEMU may not be able to bind")
+
+
 def chmod_socket_for_daemon(sock_path: Path) -> None:
     """Client mode: QEMU owns the socket, so grant the daemon access to it.
 
@@ -229,9 +255,15 @@ def handle_prepare(domain: str) -> int:
 
     if client_mode:
         # The frontend binds the socket once QEMU runs, so there is nothing to
-        # wait for here: the daemon retries until it appears. Permissions are
-        # fixed from the `started` hook, after QEMU created the socket.
+        # wait for here: the daemon retries until it appears. Two things still
+        # have to be prepared, because QEMU creates the socket itself and then
+        # blocks until a backend connects:
+        #   * the socket's directory must be writable by the QEMU user (the
+        #     default /run/vhost-user-wg belongs to the daemon and is 0755),
+        #   * the daemon must be able to connect to what QEMU creates (that is
+        #     group membership on the daemon's side, see the packaged unit).
         sock = socket_from_toml(toml_text, domain)
+        make_dir_writable_for_qemu(sock)
         log(f"client mode: {unit} started, waiting for {sock}")
         return 0
 
